@@ -6,9 +6,9 @@ import os
 import ssl
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-DEFAULT_PORT = 3232
+PORT = 3232
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 CERT_STORE = Path.home() / ".playcon_server_cert.pem"
 
@@ -21,17 +21,14 @@ class MPVIPC:
         self.request_id = 1
 
     async def connect(self) -> None:
-        if not hasattr(asyncio, "open_unix_connection"):
-            raise RuntimeError("This Python runtime does not support Unix socket IPC (common on Windows)")
-        if self.socket_path.lower().endswith(".exe"):
-            raise RuntimeError("--mpv-path must be an mpv IPC socket path, not mpv.exe")
         self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
 
     async def command(self, command: list) -> None:
         if not self.writer:
             return
-        self.writer.write((json.dumps({"command": command, "request_id": self.request_id}) + "\n").encode("utf-8"))
+        payload = {"command": command, "request_id": self.request_id}
         self.request_id += 1
+        self.writer.write((json.dumps(payload) + "\n").encode("utf-8"))
         await self.writer.drain()
 
     async def observe(self) -> None:
@@ -47,7 +44,6 @@ class SyncClient:
         self.password = args.password
         self.username = args.username
         self.server_ip = args.server_ip
-        self.port = args.port
         self.mpv = MPVIPC(args.mpv_path)
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
@@ -55,17 +51,10 @@ class SyncClient:
         self.apply_remote = False
 
     async def send_server(self, payload: dict) -> None:
-        if self.server_writer:
-            self.server_writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-            await self.server_writer.drain()
-
-    async def read_server(self, timeout: float = 8.0) -> Dict[str, Any]:
-        if not self.server_reader:
-            raise ConnectionError("Server reader unavailable")
-        line = await asyncio.wait_for(self.server_reader.readline(), timeout=timeout)
-        if not line:
-            raise ConnectionError("Server closed connection")
-        return json.loads(line.decode("utf-8"))
+        if not self.server_writer:
+            return
+        self.server_writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+        await self.server_writer.drain()
 
     async def print_header(self) -> None:
         ip_display = "(hidden)" if self.args.hide_ip else self.server_ip
@@ -74,32 +63,19 @@ class SyncClient:
         print(f"Password : {self.password}")
         print(f"Username : {self.username}")
         print(f"Server IP: {ip_display}")
-        print(f"Port     : {self.port}")
         print("=" * 72)
-
-    async def _open_plain(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=7)
-
-    async def _open_tls(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=10)
 
     async def establish_server_connection(self) -> None:
         if self.server_ip == "127.0.0.1":
-            print("[client] Trying localhost plain TCP first...")
-            try:
-                self.server_reader, self.server_writer = await self._open_plain()
-                await self.send_server({"type": "ping"})
-                msg = await self.read_server(timeout=2)
-                if msg.get("type") != "pong":
-                    raise ConnectionError(f"Unexpected probe reply: {msg}")
-                print("[client] Using plain TCP mode for localhost.")
-                return
-            except Exception as exc:
-                print(f"[client] Plain localhost mode failed ({exc}); falling back to TLS.")
-                await self._close_server_writer()
+            print("[client] Using plain TCP mode for localhost (TLS disabled).")
+            self.server_reader, self.server_writer = await asyncio.wait_for(
+                asyncio.open_connection(self.server_ip, PORT), timeout=7
+            )
+            return
 
-        self.server_reader, self.server_writer = await self._open_tls()
-        print("[client] Using TLS mode.")
+        self.server_reader, self.server_writer = await asyncio.wait_for(
+            self._connect_tls_with_validation(), timeout=10
+        )
 
     async def _connect_tls_with_validation(self):
         def make_ctx() -> ssl.SSLContext:
@@ -113,15 +89,16 @@ class SyncClient:
 
         ctx = make_ctx()
         try:
-            return await asyncio.open_connection(self.server_ip, self.port, ssl=ctx, server_hostname="Play-Con-Server")
+            return await asyncio.open_connection(self.server_ip, PORT, ssl=ctx, server_hostname="Play-Con-Server")
         except ssl.SSLCertVerificationError as exc:
             print(f"[client] Stored cert invalid or changed: {exc}")
             if not await self._prompt_trust_and_store_cert():
                 raise RuntimeError("User rejected new server certificate") from exc
-            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
+            ctx = make_ctx()
+            return await asyncio.open_connection(self.server_ip, PORT, ssl=ctx, server_hostname="Play-Con-Server")
 
     async def _prompt_trust_and_store_cert(self) -> bool:
-        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.port))
+        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, PORT))
         print("[client] Retrieved server certificate:")
         print("-" * 72)
         print("\n".join(pem.splitlines()[:8]))
@@ -133,51 +110,32 @@ class SyncClient:
         print(f"[client] Certificate saved to {CERT_STORE}")
         return True
 
-    async def _close_server_writer(self) -> None:
-        if self.server_writer:
-            self.server_writer.close()
-            try:
-                await self.server_writer.wait_closed()
-            except Exception:
-                pass
-        self.server_reader = None
-        self.server_writer = None
-
     async def run(self) -> None:
         await self.print_header()
+
         await self.establish_server_connection()
         print("[client] Connected to server.")
 
-        await self.send_server({
-            "type": "join",
-            "room": self.room,
-            "password": self.password,
-            "username": self.username,
-        })
-
-        try:
-            first = await self.read_server(timeout=8)
-        except Exception as exc:
-            raise RuntimeError(f"Join handshake failed: {exc}") from exc
-
-        if first.get("type") == "error":
-            raise RuntimeError(f"Server rejected join: {first.get('message')}")
-        if first.get("type") != "joined":
-            raise RuntimeError(f"Unexpected first server reply: {first}")
-
-        print(f"[server] Joined room {first.get('room')}")
-        state = first.get("state", {})
-        await self.apply_state_to_mpv(state)
-        print(f"[update] initial state: {state}")
+        await self.send_server(
+            {
+                "type": "join",
+                "room": self.room,
+                "password": self.password,
+                "username": self.username,
+            }
+        )
 
         try:
             await self.mpv.connect()
             await self.mpv.observe()
             print(f"[client] Connected to mpv IPC socket at {self.args.mpv_path}")
         except Exception as exc:
-            print(f"[client] Warning: mpv IPC unavailable ({exc})")
+            print(f"[client] Warning: could not connect to mpv socket ({exc})")
 
-        tasks = [asyncio.create_task(self.server_listener()), asyncio.create_task(self.mpv_listener())]
+        tasks = [
+            asyncio.create_task(self.server_listener()),
+            asyncio.create_task(self.mpv_listener()),
+        ]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in pending:
             task.cancel()
@@ -187,11 +145,22 @@ class SyncClient:
                 raise exc
 
     async def server_listener(self) -> None:
+        if not self.server_reader:
+            return
         while True:
-            data = await self.read_server(timeout=240)
+            line = await asyncio.wait_for(self.server_reader.readline(), timeout=240)
+            if not line:
+                raise ConnectionError("Server connection closed")
+            data = json.loads(line.decode("utf-8"))
             msg_type = data.get("type")
+
             if msg_type == "error":
                 print(f"[server:error] {data.get('message')}")
+            elif msg_type == "joined":
+                print(f"[server] Joined room {data.get('room')}")
+                state = data.get("state", {})
+                await self.apply_state_to_mpv(state)
+                print(f"[update] initial state: {state}")
             elif msg_type == "state_update":
                 state = data.get("state", {})
                 print(f"[update] by {data.get('by')}: {state}")
@@ -207,6 +176,7 @@ class SyncClient:
         if not self.mpv.writer:
             self.current_state.update(state)
             return
+
         self.apply_remote = True
         try:
             filename = state.get("filename")
@@ -225,6 +195,7 @@ class SyncClient:
         if not self.mpv.reader:
             while True:
                 await asyncio.sleep(60)
+            return
 
         while True:
             line = await asyncio.wait_for(self.mpv.reader.readline(), timeout=240)
@@ -234,11 +205,15 @@ class SyncClient:
                 data = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
-            if self.apply_remote or data.get("event") != "property-change":
+
+            if self.apply_remote:
                 continue
 
+            if data.get("event") != "property-change":
+                continue
             name = data.get("name")
             value = data.get("data")
+
             changed = False
             if name == "pause" and isinstance(value, bool):
                 self.current_state["paused"] = value
@@ -262,7 +237,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mpv-path", default=DEFAULT_MPV_SOCKET, help="Path to mpv JSON-IPC socket")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
     p.add_argument("--username", default=os.getenv("USER", "anonymous"), help="Display username")
     return p.parse_args()
 
