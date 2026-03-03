@@ -29,6 +29,14 @@ class RoomState:
     revision: int = 0
     updated_at: float = field(default_factory=time.monotonic)
 
+    def as_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "position": self.position,
+            "paused": self.paused,
+            "revision": self.revision,
+        }
+
 
 @dataclass(eq=False)
 class ClientConn:
@@ -36,7 +44,7 @@ class ClientConn:
     writer: asyncio.StreamWriter
     username: str = "anonymous"
     room: Optional[str] = None
-    client_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    client_id: str = field(default_factory=lambda: secrets.token_hex(6))
 
     def __hash__(self) -> int:
         return id(self)
@@ -133,7 +141,9 @@ class SyncServer:
                 "type": "joined",
                 "room": room_name,
                 "client_id": client.client_id,
-                "state": self._state_payload(room.state),
+                "state": {
+                    **room.state.as_dict(),
+                },
             },
         )
         print(f"[room:{room_name}] {username} joined ({len(room.clients)} connected)")
@@ -147,34 +157,31 @@ class SyncServer:
         if not room:
             return
 
-        event_name = data.get("event")
-        self._apply_state_patch(room, data)
+        event_name = str(data.get("event") or "state")
+
+        incoming_filename = data.get("filename")
+        if isinstance(incoming_filename, str):
+            room.state.filename = incoming_filename
+
+        try:
+            incoming_position = float(data.get("position", room.state.position))
+            if incoming_position >= 0:
+                room.state.position = incoming_position
+        except (TypeError, ValueError):
+            pass
+
+        if "paused" in data:
+            room.state.paused = bool(data.get("paused"))
+        room.state.revision += 1
 
         await self.broadcast(
             client.room,
             {
                 "type": "sync_command",
                 "by": client.username,
+                "source_client_id": client.client_id,
                 "event": event_name,
-                "state": self._state_payload(room.state),
-            },
-            exclude=client,
-        )
-
-    async def on_state_push(self, client: ClientConn, data: dict) -> None:
-        if not client.room:
-            return
-        room = self.rooms.get(client.room)
-        if not room:
-            return
-
-        self._apply_state_patch(room, data)
-        await self.broadcast(
-            client.room,
-            {
-                "type": "state_update",
-                "by": client.username,
-                "state": self._state_payload(room.state),
+                "state": room.state.as_dict(),
             },
             exclude=client,
         )
