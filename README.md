@@ -73,7 +73,7 @@ python client.py --room <room> --pass <password> --server-ip <ip_or_host> [flags
   - Required.
 - `--port <int>`
   - Server TLS port.
-  - Default: `3233`
+  - Default: `6464`
 - `--username <name>`
   - Name shown to others in room.
   - Default: value of `USER` env var or `anonymous`.
@@ -90,13 +90,13 @@ python client.py --room <room> --pass <password> --server-ip <ip_or_host> [flags
 Windows client with explicit port:
 
 ```powershell
-py client.py --room test --pass test --server-ip 151.55.120.50 --port 6464 --username oregon --mpv-path "C:\Users\X\Desktop\mpv\mpv.exe"
+py client.py --room test --pass test --server-ip 151.111.110.110 --port 6464 --username Bruh --mpv-path "C:\Users\user\Desktop\mpv\mpv.exe"
 ```
 
 Linux/macOS client:
 
 ```bash
-python client.py --room test --pass test --server-ip 151.55.120.50 --port 6464 --username alex --mpv-path /tmp/mpv-socket
+python client.py --room test --pass test --server-ip 151.111.110.110 --port 6464 --username alex --mpv-path /tmp/mpv-socket
 ```
 
 ## TLS certificate behavior
