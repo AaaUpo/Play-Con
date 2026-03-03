@@ -299,14 +299,15 @@ class SyncClient:
 
             try:
                 state = await self.connect_and_join()
-                await self.apply_state_to_mpv(state)
+                await self.apply_state_to_mpv(state, force_seek=True)
                 backoff = 1.0
 
                 server_task = asyncio.create_task(self.server_listener(), name="server_listener")
                 ping_task = asyncio.create_task(self.ping_loop(), name="ping_loop")
+                pulse_task = asyncio.create_task(self.state_pulse_loop(), name="state_pulse")
 
                 done, pending = await asyncio.wait(
-                    [server_task, ping_task, mpv_task, mpv_watchdog],
+                    [server_task, ping_task, pulse_task, mpv_task, mpv_watchdog],
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 for task in pending:
@@ -370,6 +371,7 @@ class SyncClient:
             if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
+                self.current_state["position"] = 0.0
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
@@ -382,8 +384,9 @@ class SyncClient:
 
             if "paused" in state:
                 paused = bool(state["paused"])
-                await self.mpv.command(["set_property", "pause", paused])
-                self.current_state["paused"] = paused
+                if paused != self.current_state.get("paused"):
+                    await self.mpv.command(["set_property", "pause", paused])
+                    self.current_state["paused"] = paused
         finally:
             await asyncio.sleep(0.05)
 
@@ -424,12 +427,11 @@ class SyncClient:
                 self._last_time_pos_ts = now
                 self.current_state["position"] = current
 
-                # Keep peers synced without flooding the server.
                 if should_announce_seek:
                     await self.send_control_update(event="seek")
-                elif now - self._last_position_push >= 1.0:
+                elif now - self._last_position_push >= 1.2:
                     self._last_position_push = now
-                    await self.send_control_update()
+                    await self.send_server({"type": "state_push", **self.current_state})
 
     async def send_control_update(self, event: Optional[str] = None) -> None:
         if not self.server_writer:

@@ -8,6 +8,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ class RoomState:
     position: float = 0.0
     paused: bool = True
     revision: int = 0
+    updated_at: float = field(default_factory=time.monotonic)
 
     def as_dict(self) -> dict:
         return {
@@ -81,6 +83,33 @@ class SyncServer:
                 stale.add(client)
         for client in stale:
             room.clients.discard(client)
+
+    def _state_payload(self, state: RoomState) -> dict:
+        return {
+            "filename": state.filename,
+            "position": state.position,
+            "paused": state.paused,
+            "revision": state.revision,
+        }
+
+    def _apply_state_patch(self, room: Room, data: dict) -> None:
+        incoming_filename = data.get("filename")
+        if isinstance(incoming_filename, str) and incoming_filename:
+            room.state.filename = incoming_filename
+
+        try:
+            incoming_position = float(data.get("position", room.state.position))
+            if incoming_position >= 0:
+                room.state.position = incoming_position
+        except (TypeError, ValueError):
+            pass
+
+        paused_value = data.get("paused")
+        if isinstance(paused_value, bool):
+            room.state.paused = paused_value
+
+        room.state.revision += 1
+        room.state.updated_at = time.monotonic()
 
     async def on_join(self, client: ClientConn, data: dict) -> None:
         room_name = data.get("room")
@@ -177,6 +206,8 @@ class SyncServer:
                     await self.on_join(client, data)
                 elif msg_type == "control_update":
                     await self.on_control_update(client, data)
+                elif msg_type == "state_push":
+                    await self.on_state_push(client, data)
                 elif msg_type == "ping":
                     await self.send(writer, {"type": "pong"})
                 else:
