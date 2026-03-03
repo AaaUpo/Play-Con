@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 HOST = "0.0.0.0"
-DEFAULT_PORT = 3232
+DEFAULT_PORT = 6464
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
 
