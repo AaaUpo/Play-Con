@@ -11,7 +11,6 @@ from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_PORT = 3232
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
-WINDOWS_DEFAULT_PIPE = r"\\.\pipe\playcon-mpv"
 CERT_STORE_DIR = Path.home() / ".playcon-certs"
 
 
@@ -25,11 +24,14 @@ class MPVIPC:
     async def connect(self) -> None:
         if os.name == "nt":
             raise RuntimeError(
-                "Windows named-pipe IPC is not implemented in this client yet. "
-                "mpv was started, but live local sync capture/apply is disabled on Windows for now."
+                "Windows build detected: Unix sockets are unavailable here. "
+                "Start mpv with --input-ipc-server=\\\\.\\pipe\\mpv and add pipe support in client, "
+                "or run this client in WSL/Linux."
             )
         if not hasattr(asyncio, "open_unix_connection"):
             raise RuntimeError("This Python runtime does not support Unix socket IPC")
+        if self.socket_path.lower().endswith(".exe"):
+            raise RuntimeError("--mpv-path must be an IPC socket path, not mpv.exe")
         self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
 
     async def command(self, command: list) -> None:
@@ -88,7 +90,7 @@ class SyncClient:
         return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=8)
 
     async def _open_tls(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=12)
+        return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=10)
 
     def _is_local_server(self) -> bool:
         return self.server_ip in {"127.0.0.1", "localhost", "::1"}
@@ -109,10 +111,7 @@ class SyncClient:
                 print("[client] Using plain TCP mode for localhost.")
                 return
             except Exception as exc:
-                print(
-                    "[client] Plain localhost mode failed "
-                    f"({exc}); this usually means your server expects TLS, so falling back to TLS."
-                )
+                print(f"[client] Plain localhost mode failed ({exc}); falling back to TLS.")
                 await self._close_server_writer()
 
         try:
@@ -124,7 +123,7 @@ class SyncClient:
             ) from exc
         print("[client] Using TLS mode.")
 
-    async def _connect_tls_with_validation(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def _connect_tls_with_validation(self):
         cert_store = self._cert_store_for_server()
 
         def make_ctx() -> ssl.SSLContext:
@@ -138,42 +137,19 @@ class SyncClient:
 
         if not self._is_local_server() and not cert_store.exists():
             print(f"[client] No stored certificate for {self.server_ip}:{self.port}.")
-            consent = await asyncio.to_thread(
-                input,
-                "No certificate is stored yet. Fetch and trust the server certificate now? [y/N]: ",
-            )
-            if consent.strip().lower() != "y":
-                raise RuntimeError("Connection cancelled: certificate trust was not approved")
             if not await self._prompt_trust_and_store_cert(cert_store):
                 raise RuntimeError("User rejected server certificate")
 
         try:
-            return await asyncio.open_connection(
-                self.server_ip,
-                self.port,
-                ssl=make_ctx(),
-                server_hostname="Play-Con-Server",
-            )
+            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
         except ssl.SSLCertVerificationError as exc:
             print(f"[client] Stored cert invalid or changed: {exc}")
             if not await self._prompt_trust_and_store_cert(cert_store):
                 raise RuntimeError("User rejected new server certificate") from exc
-            return await asyncio.open_connection(
-                self.server_ip,
-                self.port,
-                ssl=make_ctx(),
-                server_hostname="Play-Con-Server",
-            )
+            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
 
     async def _prompt_trust_and_store_cert(self, cert_store: Path) -> bool:
-        try:
-            pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.port))
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not retrieve certificate from {self.server_ip}:{self.port} ({exc}). "
-                "The server may be offline, blocked by firewall/NAT, or listening on a different port."
-            ) from exc
-
+        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.port))
         print("[client] Retrieved server certificate:")
         print("-" * 72)
         print("\n".join(pem.splitlines()[:8]))
@@ -187,9 +163,11 @@ class SyncClient:
         return True
 
     async def start_mpv(self) -> None:
-        if os.name != "nt":
-            with suppress(FileNotFoundError):
-                os.unlink(self.args.mpv_ipc)
+        if os.name == "nt":
+            raise RuntimeError("Windows mpv IPC is not supported by this client build")
+
+        with suppress(FileNotFoundError):
+            os.unlink(self.args.mpv_ipc)
 
         cmd = [
             self.args.mpv_path,
@@ -206,20 +184,6 @@ class SyncClient:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-
-        if os.name == "nt":
-            await asyncio.sleep(0.8)
-            if self.mpv_process.returncode is not None:
-                raise RuntimeError("mpv exited immediately after startup")
-            try:
-                await self.mpv.connect()
-                await self.mpv.observe()
-                self.mpv_ready = True
-                print(f"[client] Started mpv and connected IPC at {self.args.mpv_ipc}")
-            except RuntimeError as exc:
-                print(f"[client] Warning: {exc}")
-                print("[client] mpv is running, but local sync capture/apply is disabled on Windows.")
-            return
 
         for _ in range(50):
             if Path(self.args.mpv_ipc).exists():
@@ -238,8 +202,10 @@ class SyncClient:
     async def _close_server_writer(self) -> None:
         if self.server_writer:
             self.server_writer.close()
-            with suppress(Exception):
+            try:
                 await self.server_writer.wait_closed()
+            except Exception:
+                pass
         self.server_reader = None
         self.server_writer = None
 
@@ -248,14 +214,12 @@ class SyncClient:
         await self.establish_server_connection()
         print("[client] Connected to server.")
 
-        await self.send_server(
-            {
-                "type": "join",
-                "room": self.room,
-                "password": self.password,
-                "username": self.username,
-            }
-        )
+        await self.send_server({
+            "type": "join",
+            "room": self.room,
+            "password": self.password,
+            "username": self.username,
+        })
 
         first = await self.read_server(timeout=10)
         if first.get("type") == "error":
@@ -264,7 +228,10 @@ class SyncClient:
             raise RuntimeError(f"Unexpected first server reply: {first}")
 
         print(f"[server] Joined room {first.get('room')}")
-        await self.start_mpv()
+        try:
+            await self.start_mpv()
+        except Exception as exc:
+            raise RuntimeError(f"Unable to auto-start mpv with IPC: {exc}") from exc
 
         state = first.get("state", {})
         await self.apply_state_to_mpv(state)
@@ -292,7 +259,7 @@ class SyncClient:
                 await self.mpv.writer.wait_closed()
         if self.mpv_process and self.mpv_process.returncode is None:
             self.mpv_process.terminate()
-            with suppress(Exception):
+            with suppress(ProcessLookupError):
                 await asyncio.wait_for(self.mpv_process.wait(), timeout=3)
 
     async def server_listener(self) -> None:
@@ -366,8 +333,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--room", required=True, help="Room name")
     p.add_argument("--pass", dest="password", required=True, help="Room password")
     p.add_argument("--mpv-path", default="mpv", help="Path to mpv executable")
-    default_ipc = WINDOWS_DEFAULT_PIPE if os.name == "nt" else DEFAULT_MPV_SOCKET
-    p.add_argument("--mpv-ipc", default=default_ipc, help="Path to mpv JSON-IPC endpoint")
+    p.add_argument("--mpv-ipc", default=DEFAULT_MPV_SOCKET, help="Path to mpv JSON-IPC socket")
     p.add_argument("--media", help="Optional media file/URL to open in mpv at startup")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
