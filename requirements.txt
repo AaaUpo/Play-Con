@@ -1,0 +1,2 @@
+# Optional helper library if you want higher-level mpv IPC integration.
+python-mpv-jsonipc>=1.2.1
