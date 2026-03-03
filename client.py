@@ -12,10 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_PORT = 3232
-DEFAULT_TLS_PORT = 3233
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 DEFAULT_MPV_PIPE = r"\\.\pipe\playcon-mpv"
-CERT_STORE = Path.home() / ".playcon_server_cert.pem"
+DEFAULT_CERT_STORE = Path.home() / ".playcon_server_cert.pem"
 
 
 class MPVIPC:
@@ -108,7 +107,7 @@ class SyncClient:
         self.username = args.username
         self.server_ip = args.server_ip
         self.port = args.port
-        self.tls_port = args.tls_port
+        self.server_cert = Path(args.server_cert).expanduser()
 
         self.mpv_exec, self.mpv_ipc_path = self._resolve_mpv_launch_settings(args.mpv_path)
         self.mpv = MPVIPC(self.mpv_ipc_path)
@@ -150,13 +149,14 @@ class SyncClient:
 
     async def print_header(self) -> None:
         ip_display = "(hidden)" if self.args.hide_ip else self.server_ip
-        target_port = self.port if self._is_local_target() else self.tls_port
+        transport = "PLAINTEXT" if self._is_local_target() else "TLS"
         print("=" * 72)
         print(f"Room      : {self.room}")
         print(f"Password  : {self.password}")
         print(f"Username  : {self.username}")
         print(f"Server IP : {ip_display}")
-        print(f"Port      : {target_port}")
+        print(f"Port      : {self.port}")
+        print(f"Mode      : {transport}")
         print("=" * 72)
 
     def _is_local_target(self) -> bool:
@@ -186,8 +186,8 @@ class SyncClient:
             self.server_reader, self.server_writer = await self._open_tls()
         except OSError as exc:
             details = [
-                f"Could not connect to remote server at {self.server_ip}:{self.tls_port} over TLS ({exc}).",
-                "Check server is running, port forwarding/firewall, and matching --tls-port.",
+                f"Could not connect to remote server at {self.server_ip}:{self.port} over TLS ({exc}).",
+                "Check server is running, port forwarding/firewall, and matching --port.",
             ]
             if isinstance(exc, ConnectionRefusedError) or getattr(exc, "errno", None) in {
                 errno.ECONNREFUSED,
@@ -202,35 +202,23 @@ class SyncClient:
         print("[client] Using TLS mode.")
 
     async def _connect_tls_with_validation(self):
-        def make_ctx() -> ssl.SSLContext:
-            ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-            ctx.check_hostname = False
-            if CERT_STORE.exists():
-                ctx.load_verify_locations(cafile=str(CERT_STORE))
-            else:
-                ctx.verify_mode = ssl.CERT_NONE
-            return ctx
+        if not self.server_cert.exists():
+            raise RuntimeError(
+                "TLS connection requires a server certificate file, but none was found at "
+                f"{self.server_cert}. Ask the server host for server_cert.pem and pass it with "
+                "--server-cert /path/to/server_cert.pem."
+            )
 
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.load_verify_locations(cafile=str(self.server_cert))
         try:
-            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
+            return await asyncio.open_connection(self.server_ip, self.port, ssl=ctx, server_hostname="Play-Con-Server")
         except ssl.SSLCertVerificationError as exc:
-            print(f"[client] Stored cert invalid or changed: {exc}")
-            if not await self._prompt_trust_and_store_cert():
-                raise RuntimeError("User rejected new server certificate") from exc
-            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
-
-    async def _prompt_trust_and_store_cert(self) -> bool:
-        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.tls_port))
-        print("[client] Retrieved server certificate:")
-        print("-" * 72)
-        print("\n".join(pem.splitlines()[:8]))
-        print("...\n" + "-" * 72)
-        answer = await asyncio.to_thread(input, "Trust and store this certificate? [y/N]: ")
-        if answer.strip().lower() != "y":
-            return False
-        CERT_STORE.write_text(pem, encoding="utf-8")
-        print(f"[client] Certificate saved to {CERT_STORE}")
-        return True
+            raise RuntimeError(
+                f"TLS certificate verification failed with {self.server_cert}: {exc}. "
+                "Ensure the certificate matches the running server and request a fresh server_cert.pem from the host."
+            ) from exc
 
     async def start_mpv(self) -> None:
         if os.name != "nt":
@@ -394,8 +382,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mpv-path", default=DEFAULT_MPV_SOCKET, help="IPC path. On Windows, can also be path to mpv.exe")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Plaintext local port (default: {DEFAULT_PORT})")
-    p.add_argument("--tls-port", type=int, default=DEFAULT_TLS_PORT, help=f"TLS remote port (default: {DEFAULT_TLS_PORT})")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Target server port. Used as plaintext for localhost/LAN and TLS for remote hosts (default: {DEFAULT_PORT})")
+    p.add_argument("--server-cert", default=str(DEFAULT_CERT_STORE), help=f"TLS certificate file to trust for remote connections (default: {DEFAULT_CERT_STORE})")
     p.add_argument("--username", default=os.getenv("USER", "anonymous"), help="Display username")
     return p.parse_args()
 
