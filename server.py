@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import secrets
 import ssl
@@ -13,8 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 HOST = "0.0.0.0"
-DEFAULT_PORT = 3232
-DEFAULT_TLS_PORT = 3233
+DEFAULT_PORT = 3233
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
 
@@ -182,15 +182,30 @@ class SyncServer:
             print(f"[server] client disconnected: {peer}")
 
 
-def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
-    if cert_file.exists() and key_file.exists():
+def _san_extension(cert_host: Optional[str]) -> Optional[str]:
+    if not cert_host:
+        return None
+    try:
+        ipaddress.ip_address(cert_host)
+        return f"subjectAltName=IP:{cert_host}"
+    except ValueError:
+        return f"subjectAltName=DNS:{cert_host}"
+
+
+def ensure_self_signed_cert(cert_file: Path, key_file: Path, cert_host: Optional[str], force_regen: bool) -> None:
+    if cert_file.exists() and key_file.exists() and not force_regen:
         return
 
-    print("[server] Generating self-signed TLS certificate via openssl...")
+    cn = cert_host or "Play-Con-Server"
+    print(f"[server] Generating self-signed TLS certificate via openssl (CN={cn})...")
     cmd = [
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365", "-subj", "/CN=Play-Con-Server",
+        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365", "-subj", f"/CN={cn}",
     ]
+    san = _san_extension(cert_host)
+    if san:
+        cmd.extend(["-addext", san])
+
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
     except FileNotFoundError:
@@ -223,43 +238,39 @@ async def run_server(args: argparse.Namespace) -> None:
         print(f"WARNING: use --salt {active_salt} to keep room passwords stable after restart.")
         print("!" * 72 + "\n")
 
-    if args.port == args.tls_port:
-        raise ValueError("--port and --tls-port must be different")
+    public_ip: Optional[str] = None
+    if not args.hide_ip or not args.cert_host:
+        public_ip = get_public_ip()
 
-    ensure_self_signed_cert(CERT_FILE, KEY_FILE)
+    cert_host = args.cert_host or public_ip
+    ensure_self_signed_cert(CERT_FILE, KEY_FILE, cert_host=cert_host, force_regen=args.regenerate_cert)
+
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
-    public_ip: Optional[str] = None
-    if not args.hide_ip:
-        public_ip = get_public_ip()
-        if public_ip:
-            print(f"[server] Public IP: {public_ip}")
+    if public_ip and not args.hide_ip:
+        print(f"[server] Public IP: {public_ip}")
+    if cert_host:
+        print(f"[server] TLS certificate identity (CN/SAN): {cert_host}")
 
     sync_server = SyncServer(salt=active_salt)
-    plain_server = await asyncio.start_server(sync_server.handle_client, HOST, args.port)
-    tls_server = await asyncio.start_server(sync_server.handle_client, HOST, args.tls_port, ssl=ssl_ctx)
-
-    plain_addrs = ", ".join(str(sock.getsockname()) for sock in plain_server.sockets or [])
+    tls_server = await asyncio.start_server(sync_server.handle_client, HOST, args.port, ssl=ssl_ctx)
     tls_addrs = ", ".join(str(sock.getsockname()) for sock in tls_server.sockets or [])
-    print(f"[server] Plaintext listening on {plain_addrs}")
     print(f"[server] TLS listening on {tls_addrs} (0.0.0.0 means all local interfaces)")
     if public_ip:
-        print(f"[server] External TLS endpoint: {public_ip}:{args.tls_port}")
+        print(f"[server] External endpoint: {public_ip}:{args.port}")
 
-    async with plain_server, tls_server:
-        await asyncio.gather(
-            plain_server.serve_forever(),
-            tls_server.serve_forever(),
-        )
+    async with tls_server:
+        await tls_server.serve_forever()
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Play-Con mpv sync server")
     p.add_argument("--salt", help="Server-side salt used to hash room passwords")
     p.add_argument("--hide-ip", action="store_true", help="Hide public IP output on startup")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Plaintext local port (default: {DEFAULT_PORT})")
-    p.add_argument("--tls-port", type=int, default=DEFAULT_TLS_PORT, help=f"TLS external port (default: {DEFAULT_TLS_PORT})")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TLS listen port (default: {DEFAULT_PORT})")
+    p.add_argument("--cert-host", help="Hostname/IP to put into generated certificate CN/SAN (default: detected public IP)")
+    p.add_argument("--regenerate-cert", action="store_true", help="Force regeneration of server_cert.pem/server_key.pem")
     return p.parse_args()
 
 
