@@ -115,17 +115,15 @@ class SyncClient:
 
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
-        self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
+        self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True, "revision": 0}
         self.apply_remote = False
         self.mpv_process: Optional[asyncio.subprocess.Process] = None
+        self.last_server_revision = 0
 
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
         self._last_position_push = 0.0
-        self._suppress_local_until = 0.0
-
-        self._seek_threshold_paused = 0.12
-        self._seek_threshold_playing = 0.9
+        self._last_server_revision = -1
 
     def _resolve_mode(self, mode: str) -> str:
         if mode != "auto":
@@ -333,7 +331,7 @@ class SyncClient:
             if msg_type == "error":
                 print(f"[server:error] {data.get('message')}")
             elif msg_type == "state_update":
-                await self.apply_state_to_mpv(data.get("state", {}), source_event=data.get("event"))
+                await self.apply_state_to_mpv(data.get("state", {}), event=data.get("event"))
             elif msg_type == "user_event":
                 event = data.get("event")
                 username = data.get("username", "unknown")
@@ -355,41 +353,52 @@ class SyncClient:
             await asyncio.sleep(20)
             await self.send_server({"type": "ping"})
 
-    async def apply_state_to_mpv(self, state: Dict[str, Any], force: bool = False, source_event: Optional[str] = None) -> None:
+    async def apply_state_to_mpv(self, state: Dict[str, Any], event: Optional[str] = None) -> None:
+        incoming_revision = state.get("revision")
+        if isinstance(incoming_revision, int):
+            if incoming_revision <= self.last_server_revision:
+                return
+            self.last_server_revision = incoming_revision
+            self.current_state["revision"] = incoming_revision
+
         if not self.mpv.is_connected():
             self.current_state.update(state)
             return
+
+        incoming_revision = state.get("revision")
+        if isinstance(incoming_revision, int):
+            if incoming_revision <= self._last_server_revision:
+                return
+            self._last_server_revision = incoming_revision
 
         self.apply_remote = True
         target_paused = bool(state.get("paused", self.current_state.get("paused", True)))
         try:
             filename = state.get("filename")
-            loaded_new_file = False
-            if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
+            file_changed = isinstance(filename, str) and filename and filename != self.current_state.get("filename")
+            if file_changed:
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
-                loaded_new_file = True
+                self.current_state["position"] = 0.0
+
+            incoming_paused = bool(state.get("paused", self.current_state.get("paused", True)))
+
+            if "paused" in state:
+                await self.mpv.command(["set_property", "pause", incoming_paused])
+                self.current_state["paused"] = incoming_paused
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
                 local_pos = float(self.current_state.get("position", 0.0))
                 drift = abs(pos - local_pos)
+                drift_threshold = 0.15 if incoming_paused else 1.0
+                should_resync = drift >= drift_threshold or event in {"seek", "loadfile"}
 
-                should_seek = force or loaded_new_file or source_event in {"seek", "loadfile"}
-                if not should_seek:
-                    threshold = self._seek_threshold_paused if target_paused else self._seek_threshold_playing
-                    should_seek = drift > threshold
-
-                if should_seek:
+                if should_resync:
                     await self.mpv.command(["set_property", "time-pos", pos])
                     self._last_time_pos = pos
                     self._last_time_pos_ts = time.monotonic()
                     self.current_state["position"] = pos
-
-            if "paused" in state:
-                if self.current_state.get("paused") != target_paused:
-                    await self.mpv.command(["set_property", "pause", target_paused])
-                self.current_state["paused"] = target_paused
         finally:
             self._suppress_local_until = time.monotonic() + 0.65
             await asyncio.sleep(0.1)
