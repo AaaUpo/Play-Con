@@ -122,6 +122,7 @@ class SyncClient:
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
         self._last_position_push = 0.0
+        self._last_server_revision = -1
 
     def _resolve_mode(self, mode: str) -> str:
         if mode != "auto":
@@ -356,19 +357,33 @@ class SyncClient:
             self.current_state.update(state)
             return
 
+        incoming_revision = state.get("revision")
+        if isinstance(incoming_revision, int):
+            if incoming_revision <= self._last_server_revision:
+                return
+            self._last_server_revision = incoming_revision
+
         self.apply_remote = True
         try:
             filename = state.get("filename")
-            if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
+            file_changed = isinstance(filename, str) and filename and filename != self.current_state.get("filename")
+            if file_changed:
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
-                await self.mpv.command(["set_property", "time-pos", pos])
-                self._last_time_pos = pos
-                self._last_time_pos_ts = time.monotonic()
-                self.current_state["position"] = pos
+                local_pos = float(self.current_state.get("position", 0.0))
+                paused_remote = bool(state.get("paused", self.current_state.get("paused", True)))
+                drift = abs(local_pos - pos)
+
+                # Avoid micro-seek jitter while playback is progressing naturally.
+                should_seek = file_changed or paused_remote or drift > 0.85
+                if should_seek:
+                    await self.mpv.command(["set_property", "time-pos", pos])
+                    self._last_time_pos = pos
+                    self._last_time_pos_ts = time.monotonic()
+                    self.current_state["position"] = pos
 
             if "paused" in state:
                 paused = bool(state["paused"])
