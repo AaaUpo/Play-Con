@@ -142,7 +142,6 @@ class SyncServer:
             {
                 "type": "state_update",
                 "by": client.username,
-                "event": event_name,
                 "state": {
                     "filename": room.state.filename,
                     "position": room.state.position,
