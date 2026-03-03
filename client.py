@@ -2,7 +2,6 @@
 import argparse
 import asyncio
 import errno
-import hashlib
 import json
 import os
 import ssl
@@ -12,7 +11,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-DEFAULT_PORT = 6464
+DEFAULT_PORT = 3232
+DEFAULT_TLS_PORT = 3233
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 DEFAULT_MPV_PIPE = r"\\.\pipe\playcon-mpv"
 CERT_STORE = Path.home() / ".playcon_server_cert.pem"
@@ -108,6 +108,7 @@ class SyncClient:
         self.username = args.username
         self.server_ip = args.server_ip
         self.port = args.port
+        self.tls_port = args.tls_port
 
         self.mpv_exec, self.mpv_ipc_path = self._resolve_mpv_launch_settings(args.mpv_path)
         self.mpv = MPVIPC(self.mpv_ipc_path)
@@ -149,21 +150,44 @@ class SyncClient:
 
     async def print_header(self) -> None:
         ip_display = "(hidden)" if self.args.hide_ip else self.server_ip
+        target_port = self.port if self._is_local_target() else self.tls_port
         print("=" * 72)
         print(f"Room      : {self.room}")
         print(f"Password  : {self.password}")
         print(f"Username  : {self.username}")
         print(f"Server IP : {ip_display}")
-        print(f"Port      : {self.port}")
+        print(f"Port      : {target_port}")
         print("=" * 72)
 
+    def _is_local_target(self) -> bool:
+        target = self.server_ip.strip().lower()
+        return target in {"127.0.0.1", "localhost", "::1"}
+
+    async def _open_plain(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=8)
+
+    async def _open_tls(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=10)
+
     async def establish_server_connection(self) -> None:
+        if self._is_local_target():
+            print("[client] Localhost target detected: using plaintext only (TLS disabled).")
+            try:
+                self.server_reader, self.server_writer = await self._open_plain()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not connect to local server at {self.server_ip}:{self.port} over plaintext ({exc}). "
+                    "Check the local server --port and firewall settings."
+                ) from exc
+            print("[client] Using plaintext mode.")
+            return
+
         try:
-            self.server_reader, self.server_writer = await asyncio.wait_for(self._open_tls(), timeout=10)
+            self.server_reader, self.server_writer = await self._open_tls()
         except OSError as exc:
             details = [
-                f"Could not connect to server at {self.server_ip}:{self.port} over TLS ({exc}).",
-                "Check server is running, certificate prompt/verification, and port forwarding/firewall.",
+                f"Could not connect to remote server at {self.server_ip}:{self.tls_port} over TLS ({exc}).",
+                "Check server is running, port forwarding/firewall, and matching --tls-port.",
             ]
             if isinstance(exc, ConnectionRefusedError) or getattr(exc, "errno", None) in {
                 errno.ECONNREFUSED,
@@ -177,64 +201,34 @@ class SyncClient:
             raise RuntimeError(" ".join(details)) from exc
         print("[client] Using TLS mode.")
 
-    async def _open_tls(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    async def _connect_tls_with_validation(self):
+        def make_ctx() -> ssl.SSLContext:
+            ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ctx.check_hostname = False
+            if CERT_STORE.exists():
+                ctx.load_verify_locations(cafile=str(CERT_STORE))
+            else:
+                ctx.verify_mode = ssl.CERT_NONE
+            return ctx
 
-        reader, writer = await asyncio.open_connection(self.server_ip, self.port, ssl=ctx, server_hostname=self.server_ip)
         try:
-            await self._verify_or_trust_server_cert(writer)
-            return reader, writer
-        except Exception:
-            writer.close()
-            await writer.wait_closed()
-            raise
+            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
+        except ssl.SSLCertVerificationError as exc:
+            print(f"[client] Stored cert invalid or changed: {exc}")
+            if not await self._prompt_trust_and_store_cert():
+                raise RuntimeError("User rejected new server certificate") from exc
+            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
 
-    async def _verify_or_trust_server_cert(self, writer: asyncio.StreamWriter) -> None:
-        ssl_obj = writer.get_extra_info("ssl_object")
-        if not ssl_obj:
-            raise RuntimeError("TLS connection established without SSL object")
-        der_cert = ssl_obj.getpeercert(binary_form=True)
-        if not der_cert:
-            raise RuntimeError("Server did not provide a TLS certificate")
-
-        pem_cert = ssl.DER_cert_to_PEM_cert(der_cert)
-        current_fingerprint = hashlib.sha256(der_cert).hexdigest()
-
-        if CERT_STORE.exists():
-            stored_pem = CERT_STORE.read_text(encoding="utf-8")
-            try:
-                stored_der = ssl.PEM_cert_to_DER_cert(stored_pem)
-            except ValueError as exc:
-                raise RuntimeError(f"Stored certificate at {CERT_STORE} is invalid: {exc}") from exc
-
-            stored_fingerprint = hashlib.sha256(stored_der).hexdigest()
-            if stored_fingerprint == current_fingerprint:
-                print(f"[client] TLS certificate verified (pinned fingerprint: {current_fingerprint[:16]}...).")
-                return
-
-            print("[client] WARNING: Server certificate changed.")
-            print(f"[client] Stored fingerprint : {stored_fingerprint}")
-            print(f"[client] Presented fingerprint: {current_fingerprint}")
-            if not await self._prompt_to_store_certificate(pem_cert, current_fingerprint, is_update=True):
-                raise RuntimeError("User rejected changed server certificate")
-            return
-
-        if not await self._prompt_to_store_certificate(pem_cert, current_fingerprint, is_update=False):
-            raise RuntimeError("User rejected server certificate")
-
-    async def _prompt_to_store_certificate(self, pem_cert: str, fingerprint: str, is_update: bool) -> bool:
-        action = "replace stored" if is_update else "trust"
+    async def _prompt_trust_and_store_cert(self) -> bool:
+        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.tls_port))
         print("[client] Retrieved server certificate:")
         print("-" * 72)
-        print("\n".join(pem_cert.splitlines()[:10]))
+        print("\n".join(pem.splitlines()[:8]))
         print("...\n" + "-" * 72)
-        print(f"[client] SHA256 fingerprint: {fingerprint}")
-        answer = await asyncio.to_thread(input, f"Do you want to {action} certificate for this server? [y/N]: ")
+        answer = await asyncio.to_thread(input, "Trust and store this certificate? [y/N]: ")
         if answer.strip().lower() != "y":
             return False
-        CERT_STORE.write_text(pem_cert, encoding="utf-8")
+        CERT_STORE.write_text(pem, encoding="utf-8")
         print(f"[client] Certificate saved to {CERT_STORE}")
         return True
 
@@ -400,7 +394,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mpv-path", default=DEFAULT_MPV_SOCKET, help="IPC path. On Windows, can also be path to mpv.exe")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TLS server port (default: {DEFAULT_PORT})")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Plaintext local port (default: {DEFAULT_PORT})")
+    p.add_argument("--tls-port", type=int, default=DEFAULT_TLS_PORT, help=f"TLS remote port (default: {DEFAULT_TLS_PORT})")
     p.add_argument("--username", default=os.getenv("USER", "anonymous"), help="Display username")
     return p.parse_args()
 
