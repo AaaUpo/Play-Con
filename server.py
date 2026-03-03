@@ -27,6 +27,14 @@ class RoomState:
     paused: bool = True
     revision: int = 0
 
+    def as_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "position": self.position,
+            "paused": self.paused,
+            "revision": self.revision,
+        }
+
 
 @dataclass(eq=False)
 class ClientConn:
@@ -34,6 +42,7 @@ class ClientConn:
     writer: asyncio.StreamWriter
     username: str = "anonymous"
     room: Optional[str] = None
+    client_id: str = field(default_factory=lambda: secrets.token_hex(6))
 
     def __hash__(self) -> int:
         return id(self)
@@ -102,11 +111,9 @@ class SyncServer:
             {
                 "type": "joined",
                 "room": room_name,
+                "client_id": client.client_id,
                 "state": {
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                    "paused": room.state.paused,
-                    "revision": room.state.revision,
+                    **room.state.as_dict(),
                 },
             },
         )
@@ -121,8 +128,10 @@ class SyncServer:
         if not room:
             return
 
+        event_name = str(data.get("event") or "state")
+
         incoming_filename = data.get("filename")
-        if isinstance(incoming_filename, str) and incoming_filename:
+        if isinstance(incoming_filename, str):
             room.state.filename = incoming_filename
 
         try:
@@ -132,37 +141,21 @@ class SyncServer:
         except (TypeError, ValueError):
             pass
 
-        room.state.paused = bool(data.get("paused", room.state.paused))
+        if "paused" in data:
+            room.state.paused = bool(data.get("paused"))
         room.state.revision += 1
-
-        event_name = data.get("event")
 
         await self.broadcast(
             client.room,
             {
-                "type": "state_update",
+                "type": "sync_command",
                 "by": client.username,
-                "state": {
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                    "paused": room.state.paused,
-                    "revision": room.state.revision,
-                },
+                "source_client_id": client.client_id,
+                "event": event_name,
+                "state": room.state.as_dict(),
             },
             exclude=client,
         )
-
-        if isinstance(event_name, str) and event_name in {"loadfile", "pause", "unpause", "seek"}:
-            await self.broadcast(
-                client.room,
-                {
-                    "type": "playback_event",
-                    "by": client.username,
-                    "event": event_name,
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                },
-            )
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
