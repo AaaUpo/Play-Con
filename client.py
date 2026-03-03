@@ -122,6 +122,10 @@ class SyncClient:
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
         self._last_position_push = 0.0
+        self._suppress_local_until = 0.0
+
+        self._seek_threshold_paused = 0.12
+        self._seek_threshold_playing = 0.9
 
     def _resolve_mode(self, mode: str) -> str:
         if mode != "auto":
@@ -297,7 +301,7 @@ class SyncClient:
 
             try:
                 state = await self.connect_and_join()
-                await self.apply_state_to_mpv(state)
+                await self.apply_state_to_mpv(state, force=True, source_event="join")
                 backoff = 1.0
 
                 server_task = asyncio.create_task(self.server_listener(), name="server_listener")
@@ -329,7 +333,7 @@ class SyncClient:
             if msg_type == "error":
                 print(f"[server:error] {data.get('message')}")
             elif msg_type == "state_update":
-                await self.apply_state_to_mpv(data.get("state", {}))
+                await self.apply_state_to_mpv(data.get("state", {}), source_event=data.get("event"))
             elif msg_type == "user_event":
                 event = data.get("event")
                 username = data.get("username", "unknown")
@@ -351,31 +355,44 @@ class SyncClient:
             await asyncio.sleep(20)
             await self.send_server({"type": "ping"})
 
-    async def apply_state_to_mpv(self, state: Dict[str, Any]) -> None:
+    async def apply_state_to_mpv(self, state: Dict[str, Any], force: bool = False, source_event: Optional[str] = None) -> None:
         if not self.mpv.is_connected():
             self.current_state.update(state)
             return
 
         self.apply_remote = True
+        target_paused = bool(state.get("paused", self.current_state.get("paused", True)))
         try:
             filename = state.get("filename")
+            loaded_new_file = False
             if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
+                loaded_new_file = True
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
-                await self.mpv.command(["set_property", "time-pos", pos])
-                self._last_time_pos = pos
-                self._last_time_pos_ts = time.monotonic()
-                self.current_state["position"] = pos
+                local_pos = float(self.current_state.get("position", 0.0))
+                drift = abs(pos - local_pos)
+
+                should_seek = force or loaded_new_file or source_event in {"seek", "loadfile"}
+                if not should_seek:
+                    threshold = self._seek_threshold_paused if target_paused else self._seek_threshold_playing
+                    should_seek = drift > threshold
+
+                if should_seek:
+                    await self.mpv.command(["set_property", "time-pos", pos])
+                    self._last_time_pos = pos
+                    self._last_time_pos_ts = time.monotonic()
+                    self.current_state["position"] = pos
 
             if "paused" in state:
-                paused = bool(state["paused"])
-                await self.mpv.command(["set_property", "pause", paused])
-                self.current_state["paused"] = paused
+                if self.current_state.get("paused") != target_paused:
+                    await self.mpv.command(["set_property", "pause", target_paused])
+                self.current_state["paused"] = target_paused
         finally:
-            await asyncio.sleep(0.08)
+            self._suppress_local_until = time.monotonic() + 0.65
+            await asyncio.sleep(0.1)
             self.apply_remote = False
 
     async def mpv_listener(self) -> None:
@@ -387,7 +404,7 @@ class SyncClient:
                 data = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
-            if self.apply_remote or data.get("event") != "property-change":
+            if self.apply_remote or time.monotonic() < self._suppress_local_until or data.get("event") != "property-change":
                 continue
 
             name = data.get("name")
