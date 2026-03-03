@@ -3,7 +3,7 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
+import secrets
 import ssl
 import subprocess
 import sys
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 HOST = "0.0.0.0"
-PORT = 3232
+DEFAULT_PORT = 3232
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
 
@@ -44,19 +44,16 @@ class Room:
 
 
 class SyncServer:
-    def __init__(self, salt: Optional[str] = None):
+    def __init__(self, salt: str):
         self.salt = salt
         self.rooms: Dict[str, Room] = {}
 
     def normalize_password(self, plain_password: str) -> str:
-        if self.salt is None:
-            return plain_password
         payload = f"{self.salt}:{plain_password}".encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
     async def send(self, writer: asyncio.StreamWriter, payload: dict) -> None:
-        msg = json.dumps(payload, ensure_ascii=False) + "\n"
-        writer.write(msg.encode("utf-8"))
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
 
     async def broadcast(self, room_name: str, payload: dict, exclude: Optional[ClientConn] = None) -> None:
@@ -85,7 +82,6 @@ class SyncServer:
 
         normalized = self.normalize_password(password)
         room = self.rooms.setdefault(room_name, Room())
-
         if room.password_value is None:
             room.password_value = normalized
         elif room.password_value != normalized:
@@ -99,39 +95,33 @@ class SyncServer:
         client.username = username
         room.clients.add(client)
 
-        await self.send(
-            client.writer,
-            {
-                "type": "joined",
-                "room": room_name,
-                "state": {
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                    "paused": room.state.paused,
-                },
+        await self.send(client.writer, {
+            "type": "joined",
+            "room": room_name,
+            "state": {
+                "filename": room.state.filename,
+                "position": room.state.position,
+                "paused": room.state.paused,
             },
-        )
-
-        await self.broadcast(
-            room_name,
-            {"type": "user_event", "event": "join", "username": username},
-            exclude=client,
-        )
+        })
+        await self.broadcast(room_name, {"type": "user_event", "event": "join", "username": username}, exclude=client)
 
     async def on_state_update(self, client: ClientConn, data: dict) -> None:
         if not client.room:
             await self.send(client.writer, {"type": "error", "message": "Join a room first"})
             return
-
         room = self.rooms.get(client.room)
         if not room:
             return
 
         room.state.filename = data.get("filename", room.state.filename)
-        room.state.position = float(data.get("position", room.state.position))
+        try:
+            room.state.position = float(data.get("position", room.state.position))
+        except (TypeError, ValueError):
+            pass
         room.state.paused = bool(data.get("paused", room.state.paused))
 
-        payload = {
+        await self.broadcast(client.room, {
             "type": "state_update",
             "by": client.username,
             "state": {
@@ -139,8 +129,7 @@ class SyncServer:
                 "position": room.state.position,
                 "paused": room.state.paused,
             },
-        }
-        await self.broadcast(client.room, payload, exclude=client)
+        }, exclude=client)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
@@ -177,10 +166,7 @@ class SyncServer:
                 if not room.clients:
                     self.rooms.pop(client.room, None)
                 else:
-                    await self.broadcast(
-                        client.room,
-                        {"type": "user_event", "event": "leave", "username": client.username},
-                    )
+                    await self.broadcast(client.room, {"type": "user_event", "event": "leave", "username": client.username})
             writer.close()
             await writer.wait_closed()
             print(f"[server] client disconnected: {peer}")
@@ -192,29 +178,13 @@ def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
 
     print("[server] Generating self-signed TLS certificate via openssl...")
     cmd = [
-        "openssl",
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        str(key_file),
-        "-out",
-        str(cert_file),
-        "-days",
-        "365",
-        "-subj",
-        "/CN=Play-Con-Server",
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365", "-subj", "/CN=Play-Con-Server",
     ]
     try:
-        res = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
-        if res.stdout.strip():
-            print(res.stdout)
-        if res.stderr.strip():
-            print(res.stderr)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
     except FileNotFoundError:
-        print("[server] ERROR: openssl was not found on PATH.")
+        print("[server] ERROR: openssl not found on PATH.")
         sys.exit(1)
     except subprocess.TimeoutExpired:
         print("[server] ERROR: openssl certificate generation timed out.")
@@ -234,26 +204,32 @@ def get_public_ip(timeout: float = 3.0) -> Optional[str]:
 
 
 async def run_server(args: argparse.Namespace) -> None:
-    ensure_self_signed_cert(CERT_FILE, KEY_FILE)
-
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
-
-    sync_server = SyncServer(salt=args.salt)
-
-    if args.salt is None:
+    active_salt = args.salt
+    if not active_salt:
+        active_salt = secrets.token_urlsafe(16)
         print("\n" + "!" * 72)
-        print("WARNING: server started without --salt. Room passwords are stored in plain form.")
+        print("WARNING: --salt was not provided. A random ephemeral salt was generated.")
+        print(f"WARNING: generated salt for this run: {active_salt}")
+        print("WARNING: set --salt <value> to keep room-password hashing stable across restarts.")
         print("!" * 72 + "\n")
+
+    ssl_ctx = None
+    mode = "PLAINTEXT"
+    if not args.no_tls:
+        ensure_self_signed_cert(CERT_FILE, KEY_FILE)
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
+        mode = "TLS"
 
     if not args.hide_ip:
         public_ip = get_public_ip()
         if public_ip:
             print(f"[server] Public IP: {public_ip}")
 
-    server = await asyncio.start_server(sync_server.handle_client, HOST, PORT, ssl=ssl_ctx)
+    sync_server = SyncServer(salt=active_salt)
+    server = await asyncio.start_server(sync_server.handle_client, HOST, args.port, ssl=ssl_ctx)
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-    print(f"[server] Listening on {addrs}")
+    print(f"[server] Listening on {addrs} ({mode})")
 
     async with server:
         await server.serve_forever()
@@ -263,6 +239,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Play-Con mpv sync server")
     p.add_argument("--salt", help="Server-side salt used to hash room passwords")
     p.add_argument("--hide-ip", action="store_true", help="Hide public IP output on startup")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
+    p.add_argument("--no-tls", action="store_true", help="Disable TLS and serve plaintext TCP (mostly for local testing)")
     return p.parse_args()
 
 
