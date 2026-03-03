@@ -31,7 +31,7 @@ python server.py [flags]
   - Suppress printing the detected public IP in logs.
 - `--port <int>`
   - TLS listening port.
-  - Default: `3233`
+  - Default: `6464`
 - `--cert-host <host_or_ip>`
   - Hostname/IP written into generated TLS certificate CN/SAN.
   - If omitted, server tries to auto-detect public IP and use that.
