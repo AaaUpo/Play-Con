@@ -58,7 +58,7 @@ Important flags:
 ## Security
 - Remote connections use TLS.
 - On first remote connection, client asks to trust/store server certificate in:
-  - `~/.playcon_server_cert.pem`
+  - `~/.playcon-certs/<server>_<port>.pem`
 
 ## Troubleshooting
 - `WinError 1225` / connection refused:
