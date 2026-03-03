@@ -123,6 +123,7 @@ class SyncClient:
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
         self._last_position_push = 0.0
+        self._last_server_revision = -1
 
     def _resolve_mode(self, mode: str) -> str:
         if mode != "auto":
@@ -364,10 +365,17 @@ class SyncClient:
             self.current_state.update(state)
             return
 
+        incoming_revision = state.get("revision")
+        if isinstance(incoming_revision, int):
+            if incoming_revision <= self._last_server_revision:
+                return
+            self._last_server_revision = incoming_revision
+
         self.apply_remote = True
         try:
             filename = state.get("filename")
-            if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
+            file_changed = isinstance(filename, str) and filename and filename != self.current_state.get("filename")
+            if file_changed:
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
                 self.current_state["position"] = 0.0
