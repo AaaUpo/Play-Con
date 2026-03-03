@@ -21,10 +21,16 @@ class MPVIPC:
         self.request_id = 1
 
     async def connect(self) -> None:
+        if os.name == "nt":
+            raise RuntimeError(
+                "Windows build detected: Unix sockets are unavailable here. "
+                "Start mpv with --input-ipc-server=\\\\.\\pipe\\mpv and add pipe support in client, "
+                "or run this client in WSL/Linux."
+            )
         if not hasattr(asyncio, "open_unix_connection"):
-            raise RuntimeError("This Python runtime does not support Unix socket IPC (common on Windows)")
+            raise RuntimeError("This Python runtime does not support Unix socket IPC")
         if self.socket_path.lower().endswith(".exe"):
-            raise RuntimeError("--mpv-path must be an mpv IPC socket path, not mpv.exe")
+            raise RuntimeError("--mpv-path must be an IPC socket path, not mpv.exe")
         self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
 
     async def command(self, command: list) -> None:
@@ -53,6 +59,7 @@ class SyncClient:
         self.server_writer: Optional[asyncio.StreamWriter] = None
         self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
         self.apply_remote = False
+        self.mpv_ready = False
 
     async def send_server(self, payload: dict) -> None:
         if self.server_writer:
@@ -78,7 +85,7 @@ class SyncClient:
         print("=" * 72)
 
     async def _open_plain(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=7)
+        return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=8)
 
     async def _open_tls(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=10)
@@ -98,7 +105,13 @@ class SyncClient:
                 print(f"[client] Plain localhost mode failed ({exc}); falling back to TLS.")
                 await self._close_server_writer()
 
-        self.server_reader, self.server_writer = await self._open_tls()
+        try:
+            self.server_reader, self.server_writer = await self._open_tls()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not connect to {self.server_ip}:{self.port} over TLS ({exc}). "
+                "Check server is running, port forwarding/firewall, and matching --port."
+            ) from exc
         print("[client] Using TLS mode.")
 
     async def _connect_tls_with_validation(self):
@@ -111,9 +124,8 @@ class SyncClient:
                 ctx.verify_mode = ssl.CERT_NONE
             return ctx
 
-        ctx = make_ctx()
         try:
-            return await asyncio.open_connection(self.server_ip, self.port, ssl=ctx, server_hostname="Play-Con-Server")
+            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
         except ssl.SSLCertVerificationError as exc:
             print(f"[client] Stored cert invalid or changed: {exc}")
             if not await self._prompt_trust_and_store_cert():
@@ -155,11 +167,7 @@ class SyncClient:
             "username": self.username,
         })
 
-        try:
-            first = await self.read_server(timeout=8)
-        except Exception as exc:
-            raise RuntimeError(f"Join handshake failed: {exc}") from exc
-
+        first = await self.read_server(timeout=10)
         if first.get("type") == "error":
             raise RuntimeError(f"Server rejected join: {first.get('message')}")
         if first.get("type") != "joined":
@@ -173,17 +181,23 @@ class SyncClient:
         try:
             await self.mpv.connect()
             await self.mpv.observe()
+            self.mpv_ready = True
             print(f"[client] Connected to mpv IPC socket at {self.args.mpv_path}")
         except Exception as exc:
             print(f"[client] Warning: mpv IPC unavailable ({exc})")
 
-        tasks = [asyncio.create_task(self.server_listener()), asyncio.create_task(self.mpv_listener())]
+        tasks = [asyncio.create_task(self.server_listener(), name="server_listener")]
+        if self.mpv_ready:
+            tasks.append(asyncio.create_task(self.mpv_listener(), name="mpv_listener"))
+
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in pending:
             task.cancel()
         for task in done:
+            if task.cancelled():
+                continue
             exc = task.exception()
-            if exc:
+            if exc and not isinstance(exc, asyncio.CancelledError):
                 raise exc
 
     async def server_listener(self) -> None:
@@ -207,6 +221,7 @@ class SyncClient:
         if not self.mpv.writer:
             self.current_state.update(state)
             return
+
         self.apply_remote = True
         try:
             filename = state.get("filename")
@@ -222,10 +237,6 @@ class SyncClient:
             self.apply_remote = False
 
     async def mpv_listener(self) -> None:
-        if not self.mpv.reader:
-            while True:
-                await asyncio.sleep(60)
-
         while True:
             line = await asyncio.wait_for(self.mpv.reader.readline(), timeout=240)
             if not line:

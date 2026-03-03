@@ -49,8 +49,7 @@ class SyncServer:
         self.rooms: Dict[str, Room] = {}
 
     def normalize_password(self, plain_password: str) -> str:
-        payload = f"{self.salt}:{plain_password}".encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return hashlib.sha256(f"{self.salt}:{plain_password}".encode("utf-8")).hexdigest()
 
     async def send(self, writer: asyncio.StreamWriter, payload: dict) -> None:
         writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -62,7 +61,7 @@ class SyncServer:
             return
         stale: Set[ClientConn] = set()
         for client in room.clients:
-            if exclude is not None and client is exclude:
+            if exclude is client:
                 continue
             try:
                 await self.send(client.writer, payload)
@@ -75,13 +74,12 @@ class SyncServer:
         room_name = data.get("room")
         password = data.get("password", "")
         username = data.get("username") or "anonymous"
-
         if not room_name:
             await self.send(client.writer, {"type": "error", "message": "Missing room name"})
             return
 
-        normalized = self.normalize_password(password)
         room = self.rooms.setdefault(room_name, Room())
+        normalized = self.normalize_password(password)
         if room.password_value is None:
             room.password_value = normalized
         elif room.password_value != normalized:
@@ -157,6 +155,8 @@ class SyncServer:
                     await self.send(writer, {"type": "error", "message": f"Unknown message type: {msg_type}"})
         except asyncio.TimeoutError:
             print(f"[server] client timed out: {peer}")
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            print(f"[server] client connection dropped {peer}: {exc}")
         except Exception as exc:
             print(f"[server] client error {peer}: {exc}")
         finally:
@@ -167,8 +167,17 @@ class SyncServer:
                     self.rooms.pop(client.room, None)
                 else:
                     await self.broadcast(client.room, {"type": "user_event", "event": "leave", "username": client.username})
-            writer.close()
-            await writer.wait_closed()
+
+            try:
+                writer.close()
+            except Exception:
+                pass
+            try:
+                await writer.wait_closed()
+            except (ConnectionResetError, OSError):
+                pass
+            except Exception as exc:
+                print(f"[server] writer close warning for {peer}: {exc}")
             print(f"[server] client disconnected: {peer}")
 
 
@@ -210,7 +219,7 @@ async def run_server(args: argparse.Namespace) -> None:
         print("\n" + "!" * 72)
         print("WARNING: --salt was not provided. A random ephemeral salt was generated.")
         print(f"WARNING: generated salt for this run: {active_salt}")
-        print("WARNING: set --salt <value> to keep room-password hashing stable across restarts.")
+        print("WARNING: use --salt <value> to keep room passwords stable after restart.")
         print("!" * 72 + "\n")
 
     ssl_ctx = None
@@ -240,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--salt", help="Server-side salt used to hash room passwords")
     p.add_argument("--hide-ip", action="store_true", help="Hide public IP output on startup")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
-    p.add_argument("--no-tls", action="store_true", help="Disable TLS and serve plaintext TCP (mostly for local testing)")
+    p.add_argument("--no-tls", action="store_true", help="Disable TLS and serve plaintext TCP")
     return p.parse_args()
 
 
