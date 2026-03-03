@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import ssl
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -60,6 +61,7 @@ class SyncClient:
         self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
         self.apply_remote = False
         self.mpv_ready = False
+        self.mpv_process: Optional[asyncio.subprocess.Process] = None
 
     async def send_server(self, payload: dict) -> None:
         if self.server_writer:
@@ -155,8 +157,55 @@ class SyncClient:
         self.server_reader = None
         self.server_writer = None
 
+    async def start_mpv(self) -> None:
+        socket_path = Path(self.args.mpv_path)
+        if socket_path.exists():
+            mode = socket_path.stat().st_mode
+            if stat.S_ISSOCK(mode) or socket_path.is_file():
+                socket_path.unlink(missing_ok=True)
+
+        cmd = [
+            "mpv",
+            "--idle=yes",
+            "--force-window=yes",
+            f"--input-ipc-server={self.args.mpv_path}",
+        ]
+        print(f"[client] Launching mpv: {' '.join(cmd)}")
+        self.mpv_process = await asyncio.create_subprocess_exec(*cmd)
+
+        for _ in range(50):
+            if self.mpv_process.returncode is not None:
+                raise RuntimeError("mpv exited immediately after launch")
+            try:
+                await self.mpv.connect()
+                await self.mpv.observe()
+                self.mpv_ready = True
+                print(f"[client] Connected to mpv IPC socket at {self.args.mpv_path}")
+                return
+            except Exception:
+                await asyncio.sleep(0.1)
+
+        raise RuntimeError(f"Timed out waiting for mpv IPC socket at {self.args.mpv_path}")
+
+    async def wait_for_mpv_exit(self) -> None:
+        if not self.mpv_process:
+            return
+        code = await self.mpv_process.wait()
+        raise RuntimeError(f"mpv exited (code {code}), stopping client")
+
+    async def shutdown_mpv(self) -> None:
+        if not self.mpv_process or self.mpv_process.returncode is not None:
+            return
+        self.mpv_process.terminate()
+        try:
+            await asyncio.wait_for(self.mpv_process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            self.mpv_process.kill()
+            await self.mpv_process.wait()
+
     async def run(self) -> None:
         await self.print_header()
+        await self.start_mpv()
         await self.establish_server_connection()
         print("[client] Connected to server.")
 
@@ -178,27 +227,24 @@ class SyncClient:
         await self.apply_state_to_mpv(state)
         print(f"[update] initial state: {state}")
 
+        tasks = [
+            asyncio.create_task(self.server_listener(), name="server_listener"),
+            asyncio.create_task(self.mpv_listener(), name="mpv_listener"),
+            asyncio.create_task(self.wait_for_mpv_exit(), name="mpv_watchdog"),
+        ]
+
         try:
-            await self.mpv.connect()
-            await self.mpv.observe()
-            self.mpv_ready = True
-            print(f"[client] Connected to mpv IPC socket at {self.args.mpv_path}")
-        except Exception as exc:
-            print(f"[client] Warning: mpv IPC unavailable ({exc})")
-
-        tasks = [asyncio.create_task(self.server_listener(), name="server_listener")]
-        if self.mpv_ready:
-            tasks.append(asyncio.create_task(self.mpv_listener(), name="mpv_listener"))
-
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            if task.cancelled():
-                continue
-            exc = task.exception()
-            if exc and not isinstance(exc, asyncio.CancelledError):
-                raise exc
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc and not isinstance(exc, asyncio.CancelledError):
+                    raise exc
+        finally:
+            await self.shutdown_mpv()
 
     async def server_listener(self) -> None:
         while True:
