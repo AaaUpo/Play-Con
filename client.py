@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import ssl
@@ -14,7 +15,9 @@ from typing import Any, Dict, Optional, Tuple
 DEFAULT_PORT = 3232
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 DEFAULT_MPV_PIPE = r"\\.\pipe\playcon-mpv"
-CERT_STORE = Path.home() / ".playcon_server_cert.pem"
+CERT_STORE = Path(__file__).resolve().parent / "server_cert.pem"
+
+
 class MPVIPC:
     def __init__(self, socket_path: str):
         self.socket_path = socket_path
@@ -118,6 +121,7 @@ class SyncClient:
 
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
+        self._last_position_push = 0.0
 
     def _resolve_mode(self, mode: str) -> str:
         if mode != "auto":
@@ -163,6 +167,7 @@ class SyncClient:
         print(f"Server IP : {ip_display}")
         print(f"Port      : {self.port}")
         print(f"Mode      : {self.mode.upper()}")
+        print(f"TLS Cert  : {CERT_STORE}")
         print("=" * 72)
 
     async def establish_server_connection(self) -> None:
@@ -171,15 +176,13 @@ class SyncClient:
                 asyncio.open_connection(self.server_ip, self.port),
                 timeout=8,
             )
-            print("[client] Using plaintext mode.")
             return
 
         if not CERT_STORE.exists():
             raise RuntimeError(
                 "TLS mode selected but no trusted certificate found. "
                 f"Expected certificate at: {CERT_STORE}. "
-                "Ask the server host for server_cert.pem (created by server.py), copy it to this path, "
-                "then retry."
+                "Copy the server certificate into this exact path and retry."
             )
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -194,11 +197,29 @@ class SyncClient:
             )
         except ssl.SSLError as exc:
             raise RuntimeError(
-                "TLS handshake failed. The certificate on the server does not match your local trusted certificate. "
-                "Re-copy server_cert.pem from the host and replace your local certificate file. "
+                "TLS handshake failed. Local server_cert.pem does not match the server certificate. "
                 f"Path: {CERT_STORE}. Details: {exc}"
             ) from exc
-        print("[client] Using TLS mode.")
+
+    async def connect_and_join(self) -> Dict[str, Any]:
+        await self.establish_server_connection()
+        print(f"[client] Connected to server ({self.mode}).")
+        await self.send_server(
+            {
+                "type": "join",
+                "room": self.room,
+                "password": self.password,
+                "username": self.username,
+            }
+        )
+
+        first = await self.read_server(timeout=10)
+        if first.get("type") == "error":
+            raise RuntimeError(f"Server rejected join: {first.get('message')}")
+        if first.get("type") != "joined":
+            raise RuntimeError(f"Unexpected first server reply: {first}")
+        print(f"[server] Joined room {first.get('room')}")
+        return first.get("state", {})
 
     async def start_mpv(self) -> None:
         if os.name != "nt":
@@ -215,7 +236,7 @@ class SyncClient:
         print(f"[client] Launching mpv: {' '.join(cmd)}")
         self.mpv_process = await asyncio.create_subprocess_exec(*cmd)
 
-        for _ in range(70):
+        for _ in range(80):
             if self.mpv_process.returncode is not None:
                 raise RuntimeError("mpv exited immediately after launch")
             try:
@@ -244,47 +265,62 @@ class SyncClient:
             self.mpv_process.kill()
             await self.mpv_process.wait()
 
+    async def close_server(self) -> None:
+        if self.server_writer:
+            self.server_writer.close()
+            with contextlib.suppress(Exception):
+                await self.server_writer.wait_closed()
+        self.server_writer = None
+        self.server_reader = None
+
     async def run(self) -> None:
         await self.print_header()
         await self.start_mpv()
-        await self.establish_server_connection()
-        print("[client] Connected to server.")
 
-        await self.send_server({
-            "type": "join",
-            "room": self.room,
-            "password": self.password,
-            "username": self.username,
-        })
-
-        first = await self.read_server(timeout=10)
-        if first.get("type") == "error":
-            raise RuntimeError(f"Server rejected join: {first.get('message')}")
-        if first.get("type") != "joined":
-            raise RuntimeError(f"Unexpected first server reply: {first}")
-
-        print(f"[server] Joined room {first.get('room')}")
-        state = first.get("state", {})
-        await self.apply_state_to_mpv(state)
-
-        tasks = [
-            asyncio.create_task(self.server_listener(), name="server_listener"),
-            asyncio.create_task(self.mpv_listener(), name="mpv_listener"),
-            asyncio.create_task(self.wait_for_mpv_exit(), name="mpv_watchdog"),
-        ]
-
+        mpv_task = asyncio.create_task(self.mpv_listener(), name="mpv_listener")
+        mpv_watchdog = asyncio.create_task(self.wait_for_mpv_exit(), name="mpv_watchdog")
         try:
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                if task.cancelled():
-                    continue
-                exc = task.exception()
-                if exc and not isinstance(exc, asyncio.CancelledError):
-                    raise exc
+            await self.connection_loop(mpv_task, mpv_watchdog)
         finally:
+            mpv_task.cancel()
+            mpv_watchdog.cancel()
+            await self.close_server()
             await self.shutdown_mpv()
+
+    async def connection_loop(self, mpv_task: asyncio.Task, mpv_watchdog: asyncio.Task) -> None:
+        backoff = 1.0
+        while True:
+            if mpv_task.done():
+                await mpv_task
+            if mpv_watchdog.done():
+                await mpv_watchdog
+
+            try:
+                state = await self.connect_and_join()
+                await self.apply_state_to_mpv(state)
+                backoff = 1.0
+
+                server_task = asyncio.create_task(self.server_listener(), name="server_listener")
+                ping_task = asyncio.create_task(self.ping_loop(), name="ping_loop")
+
+                done, pending = await asyncio.wait(
+                    [server_task, ping_task, mpv_task, mpv_watchdog],
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+            except Exception as exc:
+                print(f"[client] Connection cycle ended: {exc}")
+                await self.close_server()
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 1.7, 12.0)
+                print(f"[client] Reconnecting in progress... (next retry delay cap: {backoff:.1f}s)")
 
     async def server_listener(self) -> None:
         while True:
@@ -306,9 +342,14 @@ class SyncClient:
                 position = float(data.get("position", self.current_state.get("position", 0.0)))
                 print(f"[playback] {username} {event} | file: {filename} | pos: {position:.3f}s")
             elif msg_type == "pong":
-                print("[server] pong")
+                pass
             else:
                 print(f"[server] {data}")
+
+    async def ping_loop(self) -> None:
+        while True:
+            await asyncio.sleep(20)
+            await self.send_server({"type": "ping"})
 
     async def apply_state_to_mpv(self, state: Dict[str, Any]) -> None:
         if not self.mpv.is_connected():
@@ -318,15 +359,21 @@ class SyncClient:
         self.apply_remote = True
         try:
             filename = state.get("filename")
-            if filename and filename != self.current_state.get("filename"):
+            if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
                 await self.mpv.command(["loadfile", filename, "replace"])
-            if "position" in state:
-                await self.mpv.command(["set_property", "time-pos", float(state["position"])])
-                self._last_time_pos = float(state["position"])
+                self.current_state["filename"] = filename
+
+            if "position" in state and self.current_state.get("filename"):
+                pos = float(state["position"])
+                await self.mpv.command(["set_property", "time-pos", pos])
+                self._last_time_pos = pos
                 self._last_time_pos_ts = time.monotonic()
+                self.current_state["position"] = pos
+
             if "paused" in state:
-                await self.mpv.command(["set_property", "pause", bool(state["paused"])])
-            self.current_state.update(state)
+                paused = bool(state["paused"])
+                await self.mpv.command(["set_property", "pause", paused])
+                self.current_state["paused"] = paused
         finally:
             await asyncio.sleep(0.08)
             self.apply_remote = False
@@ -362,15 +409,22 @@ class SyncClient:
                 if self._last_time_pos is not None and self._last_time_pos_ts is not None:
                     dt = now - self._last_time_pos_ts
                     expected = self._last_time_pos + (0.0 if self.current_state.get("paused", True) else dt)
-                    if abs(current - expected) > 0.35:
+                    if abs(current - expected) > 0.45:
                         should_announce_seek = True
                 self._last_time_pos = current
                 self._last_time_pos_ts = now
                 self.current_state["position"] = current
+
+                # Keep peers synced without flooding the server.
                 if should_announce_seek:
                     await self.send_control_update(event="seek")
+                elif now - self._last_position_push >= 1.0:
+                    self._last_position_push = now
+                    await self.send_control_update()
 
     async def send_control_update(self, event: Optional[str] = None) -> None:
+        if not self.server_writer:
+            return
         payload: Dict[str, Any] = {"type": "control_update", **self.current_state}
         if event:
             payload["event"] = event
