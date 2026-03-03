@@ -230,6 +230,7 @@ async def run_server(args: argparse.Namespace) -> None:
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
+    public_ip: Optional[str] = None
     if not args.hide_ip:
         public_ip = get_public_ip()
         if public_ip:
@@ -242,7 +243,9 @@ async def run_server(args: argparse.Namespace) -> None:
     plain_addrs = ", ".join(str(sock.getsockname()) for sock in plain_server.sockets or [])
     tls_addrs = ", ".join(str(sock.getsockname()) for sock in tls_server.sockets or [])
     print(f"[server] Plaintext listening on {plain_addrs}")
-    print(f"[server] TLS listening on {tls_addrs}")
+    print(f"[server] TLS listening on {tls_addrs} (0.0.0.0 means all local interfaces)")
+    if public_ip:
+        print(f"[server] External TLS endpoint: {public_ip}:{args.tls_port}")
 
     async with plain_server, tls_server:
         await asyncio.gather(
