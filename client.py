@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_PORT = 3232
+DEFAULT_TLS_PORT = 3233
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 DEFAULT_MPV_PIPE = r"\\.\pipe\playcon-mpv"
 CERT_STORE = Path.home() / ".playcon_server_cert.pem"
@@ -106,6 +107,7 @@ class SyncClient:
         self.username = args.username
         self.server_ip = args.server_ip
         self.port = args.port
+        self.tls_port = args.tls_port
 
         self.mpv_exec, self.mpv_ipc_path = self._resolve_mpv_launch_settings(args.mpv_path)
         self.mpv = MPVIPC(self.mpv_ipc_path)
@@ -127,7 +129,7 @@ class SyncClient:
             print("[client] Windows detected: --mpv-path points to mpv.exe; treating it as mpv executable path.")
             return raw, DEFAULT_MPV_PIPE
 
-        if raw.startswith("\\.\pipe\\"):
+        if raw.startswith(r"\\.\pipe\\"):
             return "mpv.exe", raw
 
         return "mpv.exe", DEFAULT_MPV_PIPE
@@ -148,12 +150,17 @@ class SyncClient:
     async def print_header(self) -> None:
         ip_display = "(hidden)" if self.args.hide_ip else self.server_ip
         print("=" * 72)
-        print(f"Room     : {self.room}")
-        print(f"Password : {self.password}")
-        print(f"Username : {self.username}")
-        print(f"Server IP: {ip_display}")
-        print(f"Port     : {self.port}")
+        print(f"Room      : {self.room}")
+        print(f"Password  : {self.password}")
+        print(f"Username  : {self.username}")
+        print(f"Server IP : {ip_display}")
+        print(f"Port      : {self.port} (plaintext local)")
+        print(f"TLS Port  : {self.tls_port} (external TLS)")
         print("=" * 72)
+
+    def _is_local_target(self) -> bool:
+        target = self.server_ip.strip().lower()
+        return target in {"127.0.0.1", "localhost", "::1"}
 
     async def _open_plain(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         return await asyncio.wait_for(asyncio.open_connection(self.server_ip, self.port), timeout=8)
@@ -162,26 +169,24 @@ class SyncClient:
         return await asyncio.wait_for(self._connect_tls_with_validation(), timeout=10)
 
     async def establish_server_connection(self) -> None:
-        if self.server_ip == "127.0.0.1":
-            print("[client] Trying localhost plain TCP first...")
+        if self._is_local_target():
+            print("[client] Localhost target detected: using plaintext only (TLS disabled).")
             try:
                 self.server_reader, self.server_writer = await self._open_plain()
-                await self.send_server({"type": "ping"})
-                msg = await self.read_server(timeout=2)
-                if msg.get("type") != "pong":
-                    raise ConnectionError(f"Unexpected probe reply: {msg}")
-                print("[client] Using plain TCP mode for localhost.")
-                return
-            except Exception as exc:
-                print(f"[client] Plain localhost mode failed ({exc}); falling back to TLS.")
-                await self._close_server_writer()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not connect to local server at {self.server_ip}:{self.port} over plaintext ({exc}). "
+                    "Check the local server --port and firewall settings."
+                ) from exc
+            print("[client] Using plaintext mode.")
+            return
 
         try:
             self.server_reader, self.server_writer = await self._open_tls()
         except OSError as exc:
             raise RuntimeError(
-                f"Could not connect to {self.server_ip}:{self.port} over TLS ({exc}). "
-                "Check server is running, port forwarding/firewall, and matching --port."
+                f"Could not connect to remote server at {self.server_ip}:{self.tls_port} over TLS ({exc}). "
+                "Check server is running, port forwarding/firewall, and matching --tls-port."
             ) from exc
         print("[client] Using TLS mode.")
 
@@ -196,15 +201,15 @@ class SyncClient:
             return ctx
 
         try:
-            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
+            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
         except ssl.SSLCertVerificationError as exc:
             print(f"[client] Stored cert invalid or changed: {exc}")
             if not await self._prompt_trust_and_store_cert():
                 raise RuntimeError("User rejected new server certificate") from exc
-            return await asyncio.open_connection(self.server_ip, self.port, ssl=make_ctx(), server_hostname="Play-Con-Server")
+            return await asyncio.open_connection(self.server_ip, self.tls_port, ssl=make_ctx(), server_hostname="Play-Con-Server")
 
     async def _prompt_trust_and_store_cert(self) -> bool:
-        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.port))
+        pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.tls_port))
         print("[client] Retrieved server certificate:")
         print("-" * 72)
         print("\n".join(pem.splitlines()[:8]))
@@ -215,16 +220,6 @@ class SyncClient:
         CERT_STORE.write_text(pem, encoding="utf-8")
         print(f"[client] Certificate saved to {CERT_STORE}")
         return True
-
-    async def _close_server_writer(self) -> None:
-        if self.server_writer:
-            self.server_writer.close()
-            try:
-                await self.server_writer.wait_closed()
-            except Exception:
-                pass
-        self.server_reader = None
-        self.server_writer = None
 
     async def start_mpv(self) -> None:
         if os.name != "nt":
@@ -388,7 +383,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mpv-path", default=DEFAULT_MPV_SOCKET, help="IPC path. On Windows, can also be path to mpv.exe")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Plaintext local port (default: {DEFAULT_PORT})")
+    p.add_argument("--tls-port", type=int, default=DEFAULT_TLS_PORT, help=f"TLS remote port (default: {DEFAULT_TLS_PORT})")
     p.add_argument("--username", default=os.getenv("USER", "anonymous"), help="Display username")
     return p.parse_args()
 

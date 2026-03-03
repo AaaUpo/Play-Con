@@ -14,6 +14,7 @@ from typing import Dict, Optional, Set
 
 HOST = "0.0.0.0"
 DEFAULT_PORT = 3232
+DEFAULT_TLS_PORT = 3233
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
 
@@ -221,14 +222,13 @@ async def run_server(args: argparse.Namespace) -> None:
         print(f"WARNING: generated salt for this run: {active_salt}")
         print(f"WARNING: use --salt {active_salt} to keep room passwords stable after restart.")
         print("!" * 72 + "\n")
-        
-    ssl_ctx = None
-    mode = "PLAINTEXT"
-    if not args.no_tls:
-        ensure_self_signed_cert(CERT_FILE, KEY_FILE)
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
-        mode = "TLS"
+
+    if args.port == args.tls_port:
+        raise ValueError("--port and --tls-port must be different")
+
+    ensure_self_signed_cert(CERT_FILE, KEY_FILE)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
     if not args.hide_ip:
         public_ip = get_public_ip()
@@ -236,20 +236,27 @@ async def run_server(args: argparse.Namespace) -> None:
             print(f"[server] Public IP: {public_ip}")
 
     sync_server = SyncServer(salt=active_salt)
-    server = await asyncio.start_server(sync_server.handle_client, HOST, args.port, ssl=ssl_ctx)
-    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-    print(f"[server] Listening on {addrs} ({mode})")
+    plain_server = await asyncio.start_server(sync_server.handle_client, HOST, args.port)
+    tls_server = await asyncio.start_server(sync_server.handle_client, HOST, args.tls_port, ssl=ssl_ctx)
 
-    async with server:
-        await server.serve_forever()
+    plain_addrs = ", ".join(str(sock.getsockname()) for sock in plain_server.sockets or [])
+    tls_addrs = ", ".join(str(sock.getsockname()) for sock in tls_server.sockets or [])
+    print(f"[server] Plaintext listening on {plain_addrs}")
+    print(f"[server] TLS listening on {tls_addrs}")
+
+    async with plain_server, tls_server:
+        await asyncio.gather(
+            plain_server.serve_forever(),
+            tls_server.serve_forever(),
+        )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Play-Con mpv sync server")
     p.add_argument("--salt", help="Server-side salt used to hash room passwords")
     p.add_argument("--hide-ip", action="store_true", help="Hide public IP output on startup")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
-    p.add_argument("--no-tls", action="store_true", help="Disable TLS and serve plaintext TCP")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Plaintext local port (default: {DEFAULT_PORT})")
+    p.add_argument("--tls-port", type=int, default=DEFAULT_TLS_PORT, help=f"TLS external port (default: {DEFAULT_TLS_PORT})")
     return p.parse_args()
 
 
