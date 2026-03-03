@@ -18,9 +18,6 @@ DEFAULT_PORT = 3232
 DEFAULT_TLS_PORT = 6464
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
-SYNC_THRESHOLD_SECONDS = 0.5
-
-
 @dataclass
 class RoomState:
     filename: str = ""
@@ -34,9 +31,6 @@ class ClientConn:
     writer: asyncio.StreamWriter
     username: str = "anonymous"
     room: Optional[str] = None
-    last_report_position: float = 0.0
-    last_report_paused: bool = True
-    last_report_filename: str = ""
 
     def __hash__(self) -> int:
         return id(self)
@@ -126,6 +120,8 @@ class SyncServer:
             pass
         room.state.paused = bool(data.get("paused", room.state.paused))
 
+        event_name = data.get("event")
+
         await self.broadcast(client.room, {
             "type": "state_update",
             "by": client.username,
@@ -136,38 +132,14 @@ class SyncServer:
             },
         }, exclude=client)
 
-    async def on_playback_report(self, client: ClientConn, data: dict) -> None:
-        if not client.room:
-            return
-        room = self.rooms.get(client.room)
-        if not room:
-            return
-
-        try:
-            client.last_report_position = float(data.get("position", 0.0))
-        except (TypeError, ValueError):
-            return
-        client.last_report_paused = bool(data.get("paused", True))
-        client.last_report_filename = str(data.get("filename", ""))
-
-        active = [
-            c for c in room.clients
-            if (not c.last_report_paused) and c.last_report_filename and c.last_report_filename == room.state.filename
-        ]
-        if len(active) < 2:
-            return
-
-        slowest = min(active, key=lambda c: c.last_report_position)
-        fastest = max(active, key=lambda c: c.last_report_position)
-        drift = fastest.last_report_position - slowest.last_report_position
-        threshold = float(data.get("threshold", SYNC_THRESHOLD_SECONDS))
-        if drift <= threshold:
-            return
-
-        target = slowest.last_report_position
-        for c in active:
-            if c.last_report_position - target > threshold:
-                await self.send(c.writer, {"type": "sync_seek", "position": target, "by": slowest.username})
+        if isinstance(event_name, str) and event_name in {"loadfile", "pause", "unpause", "seek"}:
+            await self.broadcast(client.room, {
+                "type": "playback_event",
+                "by": client.username,
+                "event": event_name,
+                "filename": room.state.filename,
+                "position": room.state.position,
+            })
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
@@ -189,8 +161,6 @@ class SyncServer:
                     await self.on_join(client, data)
                 elif msg_type == "control_update":
                     await self.on_control_update(client, data)
-                elif msg_type == "playback_report":
-                    await self.on_playback_report(client, data)
                 elif msg_type == "ping":
                     await self.send(writer, {"type": "pong"})
                 else:
