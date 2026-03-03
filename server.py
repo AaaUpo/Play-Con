@@ -18,11 +18,14 @@ DEFAULT_PORT = 3232
 DEFAULT_TLS_PORT = 6464
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
+
+
 @dataclass
 class RoomState:
     filename: str = ""
     position: float = 0.0
     paused: bool = True
+    revision: int = 0
 
 
 @dataclass(eq=False)
@@ -74,12 +77,13 @@ class SyncServer:
         room_name = data.get("room")
         password = data.get("password", "")
         username = data.get("username") or "anonymous"
-        if not room_name:
+        if not isinstance(room_name, str) or not room_name.strip():
             await self.send(client.writer, {"type": "error", "message": "Missing room name"})
             return
 
+        room_name = room_name.strip()
         room = self.rooms.setdefault(room_name, Room())
-        normalized = self.normalize_password(password)
+        normalized = self.normalize_password(str(password))
         if room.password_value is None:
             room.password_value = normalized
         elif room.password_value != normalized:
@@ -93,15 +97,19 @@ class SyncServer:
         client.username = username
         room.clients.add(client)
 
-        await self.send(client.writer, {
-            "type": "joined",
-            "room": room_name,
-            "state": {
-                "filename": room.state.filename,
-                "position": room.state.position,
-                "paused": room.state.paused,
+        await self.send(
+            client.writer,
+            {
+                "type": "joined",
+                "room": room_name,
+                "state": {
+                    "filename": room.state.filename,
+                    "position": room.state.position,
+                    "paused": room.state.paused,
+                    "revision": room.state.revision,
+                },
             },
-        })
+        )
         print(f"[room:{room_name}] {username} joined ({len(room.clients)} connected)")
         await self.broadcast(room_name, {"type": "user_event", "event": "join", "username": username}, exclude=client)
 
@@ -113,33 +121,48 @@ class SyncServer:
         if not room:
             return
 
-        room.state.filename = data.get("filename", room.state.filename)
+        incoming_filename = data.get("filename")
+        if isinstance(incoming_filename, str) and incoming_filename:
+            room.state.filename = incoming_filename
+
         try:
-            room.state.position = float(data.get("position", room.state.position))
+            incoming_position = float(data.get("position", room.state.position))
+            if incoming_position >= 0:
+                room.state.position = incoming_position
         except (TypeError, ValueError):
             pass
+
         room.state.paused = bool(data.get("paused", room.state.paused))
+        room.state.revision += 1
 
         event_name = data.get("event")
 
-        await self.broadcast(client.room, {
-            "type": "state_update",
-            "by": client.username,
-            "state": {
-                "filename": room.state.filename,
-                "position": room.state.position,
-                "paused": room.state.paused,
+        await self.broadcast(
+            client.room,
+            {
+                "type": "state_update",
+                "by": client.username,
+                "state": {
+                    "filename": room.state.filename,
+                    "position": room.state.position,
+                    "paused": room.state.paused,
+                    "revision": room.state.revision,
+                },
             },
-        }, exclude=client)
+            exclude=client,
+        )
 
         if isinstance(event_name, str) and event_name in {"loadfile", "pause", "unpause", "seek"}:
-            await self.broadcast(client.room, {
-                "type": "playback_event",
-                "by": client.username,
-                "event": event_name,
-                "filename": room.state.filename,
-                "position": room.state.position,
-            })
+            await self.broadcast(
+                client.room,
+                {
+                    "type": "playback_event",
+                    "by": client.username,
+                    "event": event_name,
+                    "filename": room.state.filename,
+                    "position": room.state.position,
+                },
+            )
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
@@ -227,9 +250,20 @@ def ensure_self_signed_cert(cert_file: Path, key_file: Path, public_ip: Optional
         config_path = tf.name
 
     cmd = [
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365",
-        "-config", config_path,
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        str(key_file),
+        "-out",
+        str(cert_file),
+        "-days",
+        "365",
+        "-config",
+        config_path,
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
