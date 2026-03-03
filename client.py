@@ -115,8 +115,9 @@ class SyncClient:
 
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
+        self.client_id: Optional[str] = None
         self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
-        self.apply_remote = False
+        self.apply_remote_until = 0.0
         self.mpv_process: Optional[asyncio.subprocess.Process] = None
 
         self._last_time_pos: Optional[float] = None
@@ -218,6 +219,7 @@ class SyncClient:
             raise RuntimeError(f"Server rejected join: {first.get('message')}")
         if first.get("type") != "joined":
             raise RuntimeError(f"Unexpected first server reply: {first}")
+        self.client_id = first.get("client_id")
         print(f"[server] Joined room {first.get('room')}")
         return first.get("state", {})
 
@@ -330,33 +332,39 @@ class SyncClient:
                 print(f"[server:error] {data.get('message')}")
             elif msg_type == "state_update":
                 await self.apply_state_to_mpv(data.get("state", {}))
+            elif msg_type == "sync_command":
+                if data.get("source_client_id") == self.client_id:
+                    continue
+                await self.apply_sync_command(data)
             elif msg_type == "user_event":
                 event = data.get("event")
                 username = data.get("username", "unknown")
                 verb = "joined" if event == "join" else "left" if event == "leave" else event
                 print(f"[room] {username} {verb} the room")
-            elif msg_type == "playback_event":
-                event = data.get("event", "unknown")
-                username = data.get("by", "unknown")
-                filename = data.get("filename") or "(no file)"
-                position = float(data.get("position", self.current_state.get("position", 0.0)))
-                print(f"[playback] {username} {event} | file: {filename} | pos: {position:.3f}s")
             elif msg_type == "pong":
                 pass
             else:
                 print(f"[server] {data}")
+
+    async def apply_sync_command(self, data: Dict[str, Any]) -> None:
+        username = data.get("by", "unknown")
+        event = str(data.get("event") or "state")
+        state = data.get("state", {})
+        position = float(state.get("position", self.current_state.get("position", 0.0)))
+        print(f"[sync] {username} -> {event} @ {position:.3f}s")
+        await self.apply_state_to_mpv(state, force_seek=event in {"seek", "loadfile", "pause", "unpause"})
 
     async def ping_loop(self) -> None:
         while True:
             await asyncio.sleep(20)
             await self.send_server({"type": "ping"})
 
-    async def apply_state_to_mpv(self, state: Dict[str, Any]) -> None:
+    async def apply_state_to_mpv(self, state: Dict[str, Any], force_seek: bool = False) -> None:
         if not self.mpv.is_connected():
             self.current_state.update(state)
             return
 
-        self.apply_remote = True
+        self.apply_remote_until = time.monotonic() + 0.8
         try:
             filename = state.get("filename")
             if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
@@ -365,18 +373,19 @@ class SyncClient:
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
-                await self.mpv.command(["set_property", "time-pos", pos])
-                self._last_time_pos = pos
-                self._last_time_pos_ts = time.monotonic()
-                self.current_state["position"] = pos
+                delta = abs(pos - float(self.current_state.get("position", 0.0)))
+                if force_seek or delta > 0.35:
+                    await self.mpv.command(["set_property", "time-pos", pos])
+                    self._last_time_pos = pos
+                    self._last_time_pos_ts = time.monotonic()
+                    self.current_state["position"] = pos
 
             if "paused" in state:
                 paused = bool(state["paused"])
                 await self.mpv.command(["set_property", "pause", paused])
                 self.current_state["paused"] = paused
         finally:
-            await asyncio.sleep(0.08)
-            self.apply_remote = False
+            await asyncio.sleep(0.05)
 
     async def mpv_listener(self) -> None:
         while True:
@@ -387,7 +396,7 @@ class SyncClient:
                 data = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
-            if self.apply_remote or data.get("event") != "property-change":
+            if time.monotonic() <= self.apply_remote_until or data.get("event") != "property-change":
                 continue
 
             name = data.get("name")
