@@ -299,7 +299,7 @@ class SyncClient:
 
             try:
                 state = await self.connect_and_join()
-                await self.apply_state_to_mpv(state)
+                await self.apply_state_to_mpv(state, force=True, source_event="join")
                 backoff = 1.0
 
                 server_task = asyncio.create_task(self.server_listener(), name="server_listener")
@@ -372,6 +372,7 @@ class SyncClient:
             self._last_server_revision = incoming_revision
 
         self.apply_remote = True
+        target_paused = bool(state.get("paused", self.current_state.get("paused", True)))
         try:
             filename = state.get("filename")
             file_changed = isinstance(filename, str) and filename and filename != self.current_state.get("filename")
@@ -399,7 +400,8 @@ class SyncClient:
                     self._last_time_pos_ts = time.monotonic()
                     self.current_state["position"] = pos
         finally:
-            await asyncio.sleep(0.08)
+            self._suppress_local_until = time.monotonic() + 0.65
+            await asyncio.sleep(0.1)
             self.apply_remote = False
 
     async def mpv_listener(self) -> None:
@@ -411,7 +413,7 @@ class SyncClient:
                 data = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
-            if self.apply_remote or data.get("event") != "property-change":
+            if self.apply_remote or time.monotonic() < self._suppress_local_until or data.get("event") != "property-change":
                 continue
 
             name = data.get("name")
