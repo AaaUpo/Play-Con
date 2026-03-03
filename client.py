@@ -115,6 +115,7 @@ class SyncClient:
 
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
+        self.client_id: Optional[str] = None
         self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
         self.apply_remote = False
         self.mpv_process: Optional[asyncio.subprocess.Process] = None
@@ -218,6 +219,7 @@ class SyncClient:
             raise RuntimeError(f"Server rejected join: {first.get('message')}")
         if first.get("type") != "joined":
             raise RuntimeError(f"Unexpected first server reply: {first}")
+        self.client_id = first.get("client_id")
         print(f"[server] Joined room {first.get('room')}")
         return first.get("state", {})
 
@@ -297,14 +299,15 @@ class SyncClient:
 
             try:
                 state = await self.connect_and_join()
-                await self.apply_state_to_mpv(state)
+                await self.apply_state_to_mpv(state, force_seek=True)
                 backoff = 1.0
 
                 server_task = asyncio.create_task(self.server_listener(), name="server_listener")
                 ping_task = asyncio.create_task(self.ping_loop(), name="ping_loop")
+                pulse_task = asyncio.create_task(self.state_pulse_loop(), name="state_pulse")
 
                 done, pending = await asyncio.wait(
-                    [server_task, ping_task, mpv_task, mpv_watchdog],
+                    [server_task, ping_task, pulse_task, mpv_task, mpv_watchdog],
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 for task in pending:
@@ -328,19 +331,17 @@ class SyncClient:
             msg_type = data.get("type")
             if msg_type == "error":
                 print(f"[server:error] {data.get('message')}")
-            elif msg_type == "state_update":
-                await self.apply_state_to_mpv(data.get("state", {}))
+            elif msg_type in {"state_update", "sync_command"}:
+                event = data.get("event")
+                by = data.get("by", "unknown")
+                await self.apply_state_to_mpv(data.get("state", {}), force_seek=msg_type == "sync_command")
+                if msg_type == "sync_command":
+                    print(f"[sync] forced '{event}' from {by}")
             elif msg_type == "user_event":
                 event = data.get("event")
                 username = data.get("username", "unknown")
                 verb = "joined" if event == "join" else "left" if event == "leave" else event
                 print(f"[room] {username} {verb} the room")
-            elif msg_type == "playback_event":
-                event = data.get("event", "unknown")
-                username = data.get("by", "unknown")
-                filename = data.get("filename") or "(no file)"
-                position = float(data.get("position", self.current_state.get("position", 0.0)))
-                print(f"[playback] {username} {event} | file: {filename} | pos: {position:.3f}s")
             elif msg_type == "pong":
                 pass
             else:
@@ -351,7 +352,13 @@ class SyncClient:
             await asyncio.sleep(20)
             await self.send_server({"type": "ping"})
 
-    async def apply_state_to_mpv(self, state: Dict[str, Any]) -> None:
+    async def state_pulse_loop(self) -> None:
+        while True:
+            await asyncio.sleep(2)
+            if self.server_writer:
+                await self.send_server({"type": "state_push", **self.current_state})
+
+    async def apply_state_to_mpv(self, state: Dict[str, Any], force_seek: bool = False) -> None:
         if not self.mpv.is_connected():
             self.current_state.update(state)
             return
@@ -362,20 +369,24 @@ class SyncClient:
             if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
+                self.current_state["position"] = 0.0
 
             if "position" in state and self.current_state.get("filename"):
-                pos = float(state["position"])
-                await self.mpv.command(["set_property", "time-pos", pos])
-                self._last_time_pos = pos
-                self._last_time_pos_ts = time.monotonic()
-                self.current_state["position"] = pos
+                target_pos = float(state["position"])
+                current_pos = float(self.current_state.get("position", 0.0))
+                if force_seek or abs(target_pos - current_pos) > 0.8:
+                    await self.mpv.command(["set_property", "time-pos", target_pos])
+                    self.current_state["position"] = target_pos
+                    self._last_time_pos = target_pos
+                    self._last_time_pos_ts = time.monotonic()
 
             if "paused" in state:
                 paused = bool(state["paused"])
-                await self.mpv.command(["set_property", "pause", paused])
-                self.current_state["paused"] = paused
+                if paused != self.current_state.get("paused"):
+                    await self.mpv.command(["set_property", "pause", paused])
+                    self.current_state["paused"] = paused
         finally:
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.05)
             self.apply_remote = False
 
     async def mpv_listener(self) -> None:
@@ -415,12 +426,11 @@ class SyncClient:
                 self._last_time_pos_ts = now
                 self.current_state["position"] = current
 
-                # Keep peers synced without flooding the server.
                 if should_announce_seek:
                     await self.send_control_update(event="seek")
-                elif now - self._last_position_push >= 1.0:
+                elif now - self._last_position_push >= 1.2:
                     self._last_position_push = now
-                    await self.send_control_update()
+                    await self.send_server({"type": "state_push", **self.current_state})
 
     async def send_control_update(self, event: Optional[str] = None) -> None:
         if not self.server_writer:

@@ -8,6 +8,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ class RoomState:
     position: float = 0.0
     paused: bool = True
     revision: int = 0
+    updated_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(eq=False)
@@ -34,6 +36,7 @@ class ClientConn:
     writer: asyncio.StreamWriter
     username: str = "anonymous"
     room: Optional[str] = None
+    client_id: str = field(default_factory=lambda: secrets.token_hex(8))
 
     def __hash__(self) -> int:
         return id(self)
@@ -73,6 +76,33 @@ class SyncServer:
         for client in stale:
             room.clients.discard(client)
 
+    def _state_payload(self, state: RoomState) -> dict:
+        return {
+            "filename": state.filename,
+            "position": state.position,
+            "paused": state.paused,
+            "revision": state.revision,
+        }
+
+    def _apply_state_patch(self, room: Room, data: dict) -> None:
+        incoming_filename = data.get("filename")
+        if isinstance(incoming_filename, str) and incoming_filename:
+            room.state.filename = incoming_filename
+
+        try:
+            incoming_position = float(data.get("position", room.state.position))
+            if incoming_position >= 0:
+                room.state.position = incoming_position
+        except (TypeError, ValueError):
+            pass
+
+        paused_value = data.get("paused")
+        if isinstance(paused_value, bool):
+            room.state.paused = paused_value
+
+        room.state.revision += 1
+        room.state.updated_at = time.monotonic()
+
     async def on_join(self, client: ClientConn, data: dict) -> None:
         room_name = data.get("room")
         password = data.get("password", "")
@@ -102,12 +132,8 @@ class SyncServer:
             {
                 "type": "joined",
                 "room": room_name,
-                "state": {
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                    "paused": room.state.paused,
-                    "revision": room.state.revision,
-                },
+                "client_id": client.client_id,
+                "state": self._state_payload(room.state),
             },
         )
         print(f"[room:{room_name}] {username} joined ({len(room.clients)} connected)")
@@ -121,48 +147,37 @@ class SyncServer:
         if not room:
             return
 
-        incoming_filename = data.get("filename")
-        if isinstance(incoming_filename, str) and incoming_filename:
-            room.state.filename = incoming_filename
-
-        try:
-            incoming_position = float(data.get("position", room.state.position))
-            if incoming_position >= 0:
-                room.state.position = incoming_position
-        except (TypeError, ValueError):
-            pass
-
-        room.state.paused = bool(data.get("paused", room.state.paused))
-        room.state.revision += 1
-
         event_name = data.get("event")
+        self._apply_state_patch(room, data)
 
+        await self.broadcast(
+            client.room,
+            {
+                "type": "sync_command",
+                "by": client.username,
+                "event": event_name,
+                "state": self._state_payload(room.state),
+            },
+            exclude=client,
+        )
+
+    async def on_state_push(self, client: ClientConn, data: dict) -> None:
+        if not client.room:
+            return
+        room = self.rooms.get(client.room)
+        if not room:
+            return
+
+        self._apply_state_patch(room, data)
         await self.broadcast(
             client.room,
             {
                 "type": "state_update",
                 "by": client.username,
-                "state": {
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                    "paused": room.state.paused,
-                    "revision": room.state.revision,
-                },
+                "state": self._state_payload(room.state),
             },
             exclude=client,
         )
-
-        if isinstance(event_name, str) and event_name in {"loadfile", "pause", "unpause", "seek"}:
-            await self.broadcast(
-                client.room,
-                {
-                    "type": "playback_event",
-                    "by": client.username,
-                    "event": event_name,
-                    "filename": room.state.filename,
-                    "position": room.state.position,
-                },
-            )
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
@@ -184,6 +199,8 @@ class SyncServer:
                     await self.on_join(client, data)
                 elif msg_type == "control_update":
                     await self.on_control_update(client, data)
+                elif msg_type == "state_push":
+                    await self.on_state_push(client, data)
                 elif msg_type == "ping":
                     await self.send(writer, {"type": "pong"})
                 else:
