@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-DEFAULT_PORT = 3233
+DEFAULT_PORT = 6464
 DEFAULT_MPV_SOCKET = "/tmp/mpv-socket"
 DEFAULT_MPV_PIPE = r"\\.\pipe\playcon-mpv"
 CERT_STORE = Path.home() / ".playcon_server_cert.pem"
