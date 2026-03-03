@@ -219,7 +219,7 @@ async def run_server(args: argparse.Namespace) -> None:
         print("\n" + "!" * 72)
         print("WARNING: --salt was not provided. A random ephemeral salt was generated.")
         print(f"WARNING: generated salt for this run: {active_salt}")
-        print(f"WARNING: use --salt {active_salt} to keep room passwords stable after restart.")
+        print("WARNING: use --salt <value> to keep room passwords stable after restart.")
         print("!" * 72 + "\n")
 
     ssl_ctx = None

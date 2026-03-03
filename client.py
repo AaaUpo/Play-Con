@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import ssl
@@ -61,7 +60,6 @@ class SyncClient:
         self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
         self.apply_remote = False
         self.mpv_ready = False
-        self.mpv_process: Optional[asyncio.subprocess.Process] = None
 
     async def send_server(self, payload: dict) -> None:
         if self.server_writer:
@@ -117,15 +115,13 @@ class SyncClient:
         print("[client] Using TLS mode.")
 
     async def _connect_tls_with_validation(self):
-        if not CERT_STORE.exists():
-            print("[client] No trusted server certificate is stored yet.")
-            if not await self._prompt_trust_and_store_cert():
-                raise RuntimeError("User rejected server certificate")
-
         def make_ctx() -> ssl.SSLContext:
             ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
             ctx.check_hostname = False
-            ctx.load_verify_locations(cafile=str(CERT_STORE))
+            if CERT_STORE.exists():
+                ctx.load_verify_locations(cafile=str(CERT_STORE))
+            else:
+                ctx.verify_mode = ssl.CERT_NONE
             return ctx
 
         try:
@@ -138,47 +134,16 @@ class SyncClient:
 
     async def _prompt_trust_and_store_cert(self) -> bool:
         pem = await asyncio.to_thread(ssl.get_server_certificate, (self.server_ip, self.port))
-        der = ssl.PEM_cert_to_DER_cert(pem)
-        fingerprint = hashlib.sha256(der).hexdigest()
         print("[client] Retrieved server certificate:")
         print("-" * 72)
         print("\n".join(pem.splitlines()[:8]))
         print("...\n" + "-" * 72)
-        print(f"[client] Certificate SHA256 fingerprint: {fingerprint}")
         answer = await asyncio.to_thread(input, "Trust and store this certificate? [y/N]: ")
         if answer.strip().lower() != "y":
             return False
         CERT_STORE.write_text(pem, encoding="utf-8")
         print(f"[client] Certificate saved to {CERT_STORE}")
         return True
-
-    async def _start_mpv(self) -> None:
-        socket_path = Path(self.args.mpv_path)
-        if socket_path.exists():
-            socket_path.unlink()
-
-        cmd = [
-            self.args.mpv_bin,
-            f"--input-ipc-server={self.args.mpv_path}",
-            "--idle=yes",
-            "--force-window=yes",
-        ] + self.args.mpv_arg
-        self.mpv_process = await asyncio.create_subprocess_exec(*cmd)
-        print(f"[client] Started mpv: {' '.join(cmd)}")
-
-        for _ in range(80):
-            if socket_path.exists():
-                return
-            if self.mpv_process.returncode is not None:
-                raise RuntimeError(f"mpv exited immediately with code {self.mpv_process.returncode}")
-            await asyncio.sleep(0.1)
-        raise RuntimeError("Timed out waiting for mpv IPC socket to appear")
-
-    async def _watch_mpv_process(self) -> None:
-        if not self.mpv_process:
-            return
-        rc = await self.mpv_process.wait()
-        raise RuntimeError(f"mpv exited with code {rc}; closing client")
 
     async def _close_server_writer(self) -> None:
         if self.server_writer:
@@ -192,54 +157,48 @@ class SyncClient:
 
     async def run(self) -> None:
         await self.print_header()
-        await self._start_mpv()
+        await self.establish_server_connection()
+        print("[client] Connected to server.")
+
+        await self.send_server({
+            "type": "join",
+            "room": self.room,
+            "password": self.password,
+            "username": self.username,
+        })
+
+        first = await self.read_server(timeout=10)
+        if first.get("type") == "error":
+            raise RuntimeError(f"Server rejected join: {first.get('message')}")
+        if first.get("type") != "joined":
+            raise RuntimeError(f"Unexpected first server reply: {first}")
+
+        print(f"[server] Joined room {first.get('room')}")
+        state = first.get("state", {})
+        await self.apply_state_to_mpv(state)
+        print(f"[update] initial state: {state}")
+
         try:
-            await self.establish_server_connection()
-            print("[client] Connected to server.")
-
-            await self.send_server({
-                "type": "join",
-                "room": self.room,
-                "password": self.password,
-                "username": self.username,
-            })
-
-            first = await self.read_server(timeout=10)
-            if first.get("type") == "error":
-                raise RuntimeError(f"Server rejected join: {first.get('message')}")
-            if first.get("type") != "joined":
-                raise RuntimeError(f"Unexpected first server reply: {first}")
-
-            print(f"[server] Joined room {first.get('room')}")
             await self.mpv.connect()
             await self.mpv.observe()
             self.mpv_ready = True
             print(f"[client] Connected to mpv IPC socket at {self.args.mpv_path}")
+        except Exception as exc:
+            print(f"[client] Warning: mpv IPC unavailable ({exc})")
 
-            state = first.get("state", {})
-            await self.apply_state_to_mpv(state)
-            print(f"[update] initial state: {state}")
+        tasks = [asyncio.create_task(self.server_listener(), name="server_listener")]
+        if self.mpv_ready:
+            tasks.append(asyncio.create_task(self.mpv_listener(), name="mpv_listener"))
 
-            tasks = [
-                asyncio.create_task(self.server_listener(), name="server_listener"),
-                asyncio.create_task(self.mpv_listener(), name="mpv_listener"),
-                asyncio.create_task(self._watch_mpv_process(), name="mpv_process_watcher"),
-            ]
-
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                if task.cancelled():
-                    continue
-                exc = task.exception()
-                if exc and not isinstance(exc, asyncio.CancelledError):
-                    raise exc
-        finally:
-            await self._close_server_writer()
-            if self.mpv_process and self.mpv_process.returncode is None:
-                self.mpv_process.terminate()
-                await self.mpv_process.wait()
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc and not isinstance(exc, asyncio.CancelledError):
+                raise exc
 
     async def server_listener(self) -> None:
         while True:
@@ -312,8 +271,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--room", required=True, help="Room name")
     p.add_argument("--pass", dest="password", required=True, help="Room password")
     p.add_argument("--mpv-path", default=DEFAULT_MPV_SOCKET, help="Path to mpv JSON-IPC socket")
-    p.add_argument("--mpv-bin", default="mpv", help="mpv executable to launch")
-    p.add_argument("--mpv-arg", action="append", default=[], help="Extra argument for mpv (repeatable)")
     p.add_argument("--hide-ip", action="store_true", help="Hide printed server IP in header")
     p.add_argument("--server-ip", required=True, help="Server IP or hostname")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
