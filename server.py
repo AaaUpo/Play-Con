@@ -7,6 +7,7 @@ import secrets
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ DEFAULT_PORT = 3232
 DEFAULT_TLS_PORT = 3233
 CERT_FILE = Path("server_cert.pem")
 KEY_FILE = Path("server_key.pem")
+SYNC_THRESHOLD_SECONDS = 0.5
 
 
 @dataclass
@@ -32,6 +34,9 @@ class ClientConn:
     writer: asyncio.StreamWriter
     username: str = "anonymous"
     room: Optional[str] = None
+    last_report_position: float = 0.0
+    last_report_paused: bool = True
+    last_report_filename: str = ""
 
     def __hash__(self) -> int:
         return id(self)
@@ -103,9 +108,10 @@ class SyncServer:
                 "paused": room.state.paused,
             },
         })
+        print(f"[room:{room_name}] {username} joined ({len(room.clients)} connected)")
         await self.broadcast(room_name, {"type": "user_event", "event": "join", "username": username}, exclude=client)
 
-    async def on_state_update(self, client: ClientConn, data: dict) -> None:
+    async def on_control_update(self, client: ClientConn, data: dict) -> None:
         if not client.room:
             await self.send(client.writer, {"type": "error", "message": "Join a room first"})
             return
@@ -130,6 +136,39 @@ class SyncServer:
             },
         }, exclude=client)
 
+    async def on_playback_report(self, client: ClientConn, data: dict) -> None:
+        if not client.room:
+            return
+        room = self.rooms.get(client.room)
+        if not room:
+            return
+
+        try:
+            client.last_report_position = float(data.get("position", 0.0))
+        except (TypeError, ValueError):
+            return
+        client.last_report_paused = bool(data.get("paused", True))
+        client.last_report_filename = str(data.get("filename", ""))
+
+        active = [
+            c for c in room.clients
+            if (not c.last_report_paused) and c.last_report_filename and c.last_report_filename == room.state.filename
+        ]
+        if len(active) < 2:
+            return
+
+        slowest = min(active, key=lambda c: c.last_report_position)
+        fastest = max(active, key=lambda c: c.last_report_position)
+        drift = fastest.last_report_position - slowest.last_report_position
+        threshold = float(data.get("threshold", SYNC_THRESHOLD_SECONDS))
+        if drift <= threshold:
+            return
+
+        target = slowest.last_report_position
+        for c in active:
+            if c.last_report_position - target > threshold:
+                await self.send(c.writer, {"type": "sync_seek", "position": target, "by": slowest.username})
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = ClientConn(reader=reader, writer=writer)
         peer = writer.get_extra_info("peername")
@@ -148,8 +187,10 @@ class SyncServer:
                 msg_type = data.get("type")
                 if msg_type == "join":
                     await self.on_join(client, data)
-                elif msg_type == "state_update":
-                    await self.on_state_update(client, data)
+                elif msg_type == "control_update":
+                    await self.on_control_update(client, data)
+                elif msg_type == "playback_report":
+                    await self.on_playback_report(client, data)
                 elif msg_type == "ping":
                     await self.send(writer, {"type": "pong"})
                 else:
@@ -168,6 +209,7 @@ class SyncServer:
                     self.rooms.pop(client.room, None)
                 else:
                     await self.broadcast(client.room, {"type": "user_event", "event": "leave", "username": client.username})
+                print(f"[room:{client.room}] {client.username} left ({len(room.clients)} connected)")
 
             try:
                 writer.close()
@@ -177,19 +219,47 @@ class SyncServer:
                 await writer.wait_closed()
             except (ConnectionResetError, OSError):
                 pass
-            except Exception as exc:
-                print(f"[server] writer close warning for {peer}: {exc}")
             print(f"[server] client disconnected: {peer}")
 
 
-def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
+def _build_self_signed_openssl_config(public_ip: Optional[str]) -> str:
+    san_entries = ["DNS:localhost", "IP:127.0.0.1", "IP:0.0.0.0"]
+    if public_ip:
+        san_entries.append(f"IP:{public_ip}")
+
+    return f"""
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = Play-Con-Server
+
+[v3_req]
+subjectAltName = {', '.join(san_entries)}
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+""".strip()
+
+
+def ensure_self_signed_cert(cert_file: Path, key_file: Path, public_ip: Optional[str]) -> None:
     if cert_file.exists() and key_file.exists():
+        print(f"[server] Reusing existing TLS cert/key: {cert_file}, {key_file}")
         return
 
     print("[server] Generating self-signed TLS certificate via openssl...")
+    cfg = _build_self_signed_openssl_config(public_ip)
+    with tempfile.NamedTemporaryFile("w", suffix=".cnf", delete=False) as tf:
+        tf.write(cfg)
+        config_path = tf.name
+
     cmd = [
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365", "-subj", "/CN=Play-Con-Server",
+        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365",
+        "-config", config_path,
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
@@ -202,6 +272,10 @@ def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
     except subprocess.CalledProcessError as exc:
         print(f"[server] ERROR: openssl failed: {exc.stderr or exc}")
         sys.exit(1)
+    finally:
+        Path(config_path).unlink(missing_ok=True)
+
+    print(f"[server] Created {cert_file}. Share this file securely with TLS clients.")
 
 
 def get_public_ip(timeout: float = 3.0) -> Optional[str]:
@@ -226,15 +300,15 @@ async def run_server(args: argparse.Namespace) -> None:
     if args.port == args.tls_port:
         raise ValueError("--port and --tls-port must be different")
 
-    ensure_self_signed_cert(CERT_FILE, KEY_FILE)
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
-
     public_ip: Optional[str] = None
     if not args.hide_ip:
         public_ip = get_public_ip()
         if public_ip:
             print(f"[server] Public IP: {public_ip}")
+
+    ensure_self_signed_cert(CERT_FILE, KEY_FILE, public_ip)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
     sync_server = SyncServer(salt=active_salt)
     plain_server = await asyncio.start_server(sync_server.handle_client, HOST, args.port)
