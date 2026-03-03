@@ -7,6 +7,7 @@ import secrets
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -182,16 +183,38 @@ class SyncServer:
             print(f"[server] client disconnected: {peer}")
 
 
-def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
+def ensure_self_signed_cert(cert_file: Path, key_file: Path, public_ip: Optional[str]) -> None:
     if cert_file.exists() and key_file.exists():
         return
 
     print("[server] Generating self-signed TLS certificate via openssl...")
+    san_entries = ["DNS:Play-Con-Server", "IP:127.0.0.1", "IP:::1"]
+    if public_ip:
+        san_entries.append(f"IP:{public_ip}")
+    san = ",".join(san_entries)
+    openssl_cfg = f"""
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = Play-Con-Server
+
+[v3_req]
+subjectAltName = {san}
+""".strip()
+
     cmd = [
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365", "-subj", "/CN=Play-Con-Server",
+        "-keyout", str(key_file), "-out", str(cert_file), "-days", "365",
+        "-config", "__OPENSSL_CONFIG__", "-extensions", "v3_req",
     ]
     try:
+        with tempfile.NamedTemporaryFile("w", suffix=".cnf", delete=False, encoding="utf-8") as cfg:
+            cfg.write(openssl_cfg)
+            cfg_path = Path(cfg.name)
+        cmd = [part if part != "__OPENSSL_CONFIG__" else str(cfg_path) for part in cmd]
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
     except FileNotFoundError:
         print("[server] ERROR: openssl not found on PATH.")
@@ -202,6 +225,9 @@ def ensure_self_signed_cert(cert_file: Path, key_file: Path) -> None:
     except subprocess.CalledProcessError as exc:
         print(f"[server] ERROR: openssl failed: {exc.stderr or exc}")
         sys.exit(1)
+    finally:
+        if 'cfg_path' in locals():
+            cfg_path.unlink(missing_ok=True)
 
 
 def get_public_ip(timeout: float = 3.0) -> Optional[str]:
@@ -226,15 +252,15 @@ async def run_server(args: argparse.Namespace) -> None:
     if args.port == args.tls_port:
         raise ValueError("--port and --tls-port must be different")
 
-    ensure_self_signed_cert(CERT_FILE, KEY_FILE)
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
-
     public_ip: Optional[str] = None
     if not args.hide_ip:
         public_ip = get_public_ip()
         if public_ip:
             print(f"[server] Public IP: {public_ip}")
+
+    ensure_self_signed_cert(CERT_FILE, KEY_FILE, public_ip)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
     sync_server = SyncServer(salt=active_salt)
     plain_server = await asyncio.start_server(sync_server.handle_client, HOST, args.port)
@@ -246,6 +272,7 @@ async def run_server(args: argparse.Namespace) -> None:
     print(f"[server] TLS listening on {tls_addrs} (0.0.0.0 means all local interfaces)")
     if public_ip:
         print(f"[server] External TLS endpoint: {public_ip}:{args.tls_port}")
+    print(f"[server] Share this file with remote clients for TLS trust: {CERT_FILE.resolve()}")
 
     async with plain_server, tls_server:
         await asyncio.gather(
