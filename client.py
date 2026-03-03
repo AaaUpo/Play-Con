@@ -115,9 +115,10 @@ class SyncClient:
 
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
-        self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True}
+        self.current_state: Dict[str, Any] = {"filename": "", "position": 0.0, "paused": True, "revision": 0}
         self.apply_remote = False
         self.mpv_process: Optional[asyncio.subprocess.Process] = None
+        self.last_server_revision = 0
 
         self._last_time_pos: Optional[float] = None
         self._last_time_pos_ts: Optional[float] = None
@@ -329,7 +330,7 @@ class SyncClient:
             if msg_type == "error":
                 print(f"[server:error] {data.get('message')}")
             elif msg_type == "state_update":
-                await self.apply_state_to_mpv(data.get("state", {}))
+                await self.apply_state_to_mpv(data.get("state", {}), event=data.get("event"))
             elif msg_type == "user_event":
                 event = data.get("event")
                 username = data.get("username", "unknown")
@@ -351,7 +352,14 @@ class SyncClient:
             await asyncio.sleep(20)
             await self.send_server({"type": "ping"})
 
-    async def apply_state_to_mpv(self, state: Dict[str, Any]) -> None:
+    async def apply_state_to_mpv(self, state: Dict[str, Any], event: Optional[str] = None) -> None:
+        incoming_revision = state.get("revision")
+        if isinstance(incoming_revision, int):
+            if incoming_revision <= self.last_server_revision:
+                return
+            self.last_server_revision = incoming_revision
+            self.current_state["revision"] = incoming_revision
+
         if not self.mpv.is_connected():
             self.current_state.update(state)
             return
@@ -362,18 +370,26 @@ class SyncClient:
             if isinstance(filename, str) and filename and filename != self.current_state.get("filename"):
                 await self.mpv.command(["loadfile", filename, "replace"])
                 self.current_state["filename"] = filename
+                self.current_state["position"] = 0.0
+
+            incoming_paused = bool(state.get("paused", self.current_state.get("paused", True)))
+
+            if "paused" in state:
+                await self.mpv.command(["set_property", "pause", incoming_paused])
+                self.current_state["paused"] = incoming_paused
 
             if "position" in state and self.current_state.get("filename"):
                 pos = float(state["position"])
-                await self.mpv.command(["set_property", "time-pos", pos])
-                self._last_time_pos = pos
-                self._last_time_pos_ts = time.monotonic()
-                self.current_state["position"] = pos
+                local_pos = float(self.current_state.get("position", 0.0))
+                drift = abs(pos - local_pos)
+                drift_threshold = 0.15 if incoming_paused else 1.0
+                should_resync = drift >= drift_threshold or event in {"seek", "loadfile"}
 
-            if "paused" in state:
-                paused = bool(state["paused"])
-                await self.mpv.command(["set_property", "pause", paused])
-                self.current_state["paused"] = paused
+                if should_resync:
+                    await self.mpv.command(["set_property", "time-pos", pos])
+                    self._last_time_pos = pos
+                    self._last_time_pos_ts = time.monotonic()
+                    self.current_state["position"] = pos
         finally:
             await asyncio.sleep(0.08)
             self.apply_remote = False
