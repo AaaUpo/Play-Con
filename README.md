@@ -53,7 +53,7 @@ Important flags:
 ## Windows note
 - Client launches mpv on Windows.
 - mpv IPC control uses named pipes on Windows and is not yet implemented in this client.
-  - Result: network sync still works, but local mpv event capture/apply is unavailable until pipe IPC is added.
+  - Result: client will not crash; it warns and continues network-only sync without local mpv event capture/apply until pipe IPC is added.
 
 ## Security
 - Remote connections use TLS.
