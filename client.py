@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import errno
 import json
 import os
 import ssl
@@ -149,13 +150,13 @@ class SyncClient:
 
     async def print_header(self) -> None:
         ip_display = "(hidden)" if self.args.hide_ip else self.server_ip
+        target_port = self.port if self._is_local_target() else self.tls_port
         print("=" * 72)
         print(f"Room      : {self.room}")
         print(f"Password  : {self.password}")
         print(f"Username  : {self.username}")
         print(f"Server IP : {ip_display}")
-        print(f"Port      : {self.port} (plaintext local)")
-        print(f"TLS Port  : {self.tls_port} (external TLS)")
+        print(f"Port      : {target_port}")
         print("=" * 72)
 
     def _is_local_target(self) -> bool:
@@ -184,10 +185,20 @@ class SyncClient:
         try:
             self.server_reader, self.server_writer = await self._open_tls()
         except OSError as exc:
-            raise RuntimeError(
-                f"Could not connect to remote server at {self.server_ip}:{self.tls_port} over TLS ({exc}). "
-                "Check server is running, port forwarding/firewall, and matching --tls-port."
-            ) from exc
+            details = [
+                f"Could not connect to remote server at {self.server_ip}:{self.tls_port} over TLS ({exc}).",
+                "Check server is running, port forwarding/firewall, and matching --tls-port.",
+            ]
+            if isinstance(exc, ConnectionRefusedError) or getattr(exc, "errno", None) in {
+                errno.ECONNREFUSED,
+                getattr(errno, "WSAECONNREFUSED", 10061),
+            }:
+                details.append(
+                    "If client and server are on the same machine/network, do not use the public IP from inside the LAN: "
+                    "use --server-ip 127.0.0.1 (same PC) or the server's LAN IP (e.g. 192.168.x.x). "
+                    "Many routers/ISPs block NAT loopback (hairpin), which causes this exact refusal."
+                )
+            raise RuntimeError(" ".join(details)) from exc
         print("[client] Using TLS mode.")
 
     async def _connect_tls_with_validation(self):
